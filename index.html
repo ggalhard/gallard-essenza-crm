@@ -167,6 +167,34 @@ p{margin:0}
 }
 .section-label:first-child{margin-top:2px}
 
+/* navegador de mês do Financeiro */
+.mesnav{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  background:var(--surface-card);border-radius:var(--radius);
+  padding:8px 8px;box-shadow:var(--shadow);margin-bottom:12px;
+}
+.mesnav button{
+  flex:0 0 auto;width:40px;height:40px;border:0;border-radius:12px;
+  background:var(--surface-card-2);color:var(--ink);font-size:20px;line-height:1;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+}
+.mesnav button:disabled{opacity:.3;cursor:default}
+.mesnav .rotulo{
+  flex:1;text-align:center;font-weight:600;font-size:15px;
+}
+.mesnav .rotulo small{
+  display:block;font-size:11px;font-weight:500;color:var(--ink-faint);
+  text-transform:none;letter-spacing:.04em;margin-top:1px;
+}
+
+/* linha de categoria com barra proporcional */
+.catrow{margin:0 2px 10px}
+.catrow .topo{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:14px}
+.catrow .nome{color:var(--ink)}
+.catrow .val{font-weight:600}
+.catrow .trilho{height:6px;border-radius:99px;background:var(--surface-card-2);margin-top:6px;overflow:hidden}
+.catrow .barra{height:100%;border-radius:99px}
+
 .kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .kpi{
   background:var(--surface-card);border-radius:var(--radius);padding:14px 14px 12px;
@@ -534,6 +562,74 @@ function computeKPIs(){
   return {clientesAtivos, leadsNovos, pedidosMes, pedidosMesValidos, faturamentoMes,
           custoMes, lucroMes, estoqueBaixo, estoqueNegativo, valorEstoque,
           followupsPendentes, followupsAtrasados, saldo};
+}
+
+/* ============================================================
+   FINANCEIRO POR MÊS
+
+   Os lançamentos sempre tiveram data, mas a tela mostrava tudo numa
+   lista só, com um saldo geral — dava pra saber quanto tem no caixa,
+   não como o mês foi. Aqui ficam as contas por competência mensal.
+   ============================================================ */
+
+const MESES = ["janeiro","fevereiro","março","abril","maio","junho",
+               "julho","agosto","setembro","outubro","novembro","dezembro"];
+
+function ymAtual(){ return todayISO().slice(0,7); }
+
+function nomeMes(ym, capitalizado){
+  const [a,m] = ym.split("-");
+  const nome = MESES[Number(m)-1];
+  // capitaliza só a primeira letra aqui, no lugar de usar
+  // text-transform:capitalize no CSS — que deixaria "Agosto De 2026"
+  return `${capitalizado ? nome[0].toUpperCase()+nome.slice(1) : nome} de ${a}`;
+}
+
+/* Anda pra frente ou pra trás sem depender de Date (que tropeça em
+   virada de ano e fuso). */
+function deslocaMes(ym, delta){
+  let [a,m] = ym.split("-").map(Number);
+  m += delta;
+  while(m < 1){ m += 12; a--; }
+  while(m > 12){ m -= 12; a++; }
+  return `${a}-${String(m).padStart(2,"0")}`;
+}
+
+/* Fecha o mês: entradas, saídas, resultado e o saldo acumulado até o
+   último dia dele — o acumulado é o que responde "quanto eu tinha em
+   caixa no fim daquele mês", diferente do resultado isolado. */
+function resumoMes(ym){
+  const doMes = db.financeiro.filter(f => (f.data||"").slice(0,7) === ym);
+  const entradas = doMes.filter(f=>f.tipo==="Entrada").reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const saidas   = doMes.filter(f=>f.tipo==="Saída").reduce((s,f)=>s+(Number(f.valor)||0),0);
+
+  const acumulado = db.financeiro
+    .filter(f => (f.data||"").slice(0,7) <= ym)
+    .reduce((s,f)=> s + (f.tipo==="Entrada" ? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+
+  // agrupa por categoria, separando o que entrou do que saiu
+  const porCategoria = (tipo)=>{
+    const mapa = {};
+    doMes.filter(f=>f.tipo===tipo).forEach(f=>{
+      const cat = f.categoria || "Outro";
+      mapa[cat] = (mapa[cat]||0) + (Number(f.valor)||0);
+    });
+    return Object.entries(mapa).sort((a,b)=> b[1]-a[1]);
+  };
+
+  return {
+    ym, lancamentos: doMes, entradas, saidas,
+    resultado: entradas - saidas,
+    acumulado,
+    entradasPorCategoria: porCategoria("Entrada"),
+    saidasPorCategoria: porCategoria("Saída"),
+  };
+}
+
+/* Meses que têm algum lançamento — usado pra dizer se vale oferecer
+   navegação e pra montar o histórico. */
+function mesesComMovimento(){
+  return [...new Set(db.financeiro.map(f=>(f.data||"").slice(0,7)).filter(Boolean))].sort();
 }
 
 /* ---------- roteamento simples ---------- */
@@ -967,29 +1063,103 @@ function bumpEstoque(id, delta){
 }
 
 /* ---------- FINANCEIRO ---------- */
+function catRow(nome, valor, total, cor){
+  const pct = total>0 ? Math.round(valor/total*100) : 0;
+  return `<div class="catrow">
+    <div class="topo"><span class="nome">${esc(nome)}</span><span class="val tnum">${fmtMoney(valor)}</span></div>
+    <div class="trilho"><div class="barra" style="width:${pct}%;background:${cor}"></div></div>
+  </div>`;
+}
+
 function renderFinanceiro(c){
-  const k = computeKPIs();
-  const list = db.financeiro.slice().sort((a,b)=> b.data.localeCompare(a.data));
+  state.finMes = state.finMes || ymAtual();
+  const ym = state.finMes;
+  const r = resumoMes(ym);
+  const meses = mesesComMovimento();
+  const anterior = resumoMes(deslocaMes(ym,-1));
+
+  // só trava a navegação onde não existe mais nada pra ver: antes do
+  // primeiro lançamento e depois do mês atual
+  const primeiroMes = meses.length ? meses[0] : ymAtual();
+  const podeVoltar = ym > primeiroMes;
+  const podeAvancar = ym < ymAtual();
+
+  const difResultado = r.resultado - anterior.resultado;
+  const temAnterior = anterior.lancamentos.length > 0;
+
   c.innerHTML = `
-    <div class="kpi" style="margin-bottom:16px">
-      <div class="v tnum">${fmtMoney(k.saldo)}</div><div class="l">Saldo (entradas − saídas)</div>
+    <div class="mesnav">
+      <button id="mes-ant" ${podeVoltar?"":"disabled"} aria-label="Mês anterior">‹</button>
+      <div class="rotulo">${nomeMes(ym,true)}<small>${r.lancamentos.length} lançamento(s)</small></div>
+      <button id="mes-prox" ${podeAvancar?"":"disabled"} aria-label="Próximo mês">›</button>
     </div>
+
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v tnum" style="color:var(--ok)">${fmtMoney(r.entradas)}</div><div class="l">Entrou no mês</div></div>
+      <div class="kpi"><div class="v tnum" style="color:var(--critical)">${fmtMoney(r.saidas)}</div><div class="l">Saiu no mês</div></div>
+    </div>
+
+    <div class="kpi" style="margin-top:10px">
+      <div class="v tnum" style="color:${r.resultado>=0?'var(--ok)':'var(--critical)'}">${r.resultado>=0?"+":"−"} ${fmtMoney(Math.abs(r.resultado))}</div>
+      <div class="l">Resultado de ${nomeMes(ym).split(" de ")[0]}${temAnterior?` · ${difResultado>=0?"▲":"▼"} ${fmtMoney(Math.abs(difResultado))} vs. mês anterior`:""}</div>
+    </div>
+
+    <div class="kpi" style="margin-top:10px">
+      <div class="v tnum">${fmtMoney(r.acumulado)}</div>
+      <div class="l">Saldo acumulado até o fim desse mês</div>
+    </div>
+
+    ${r.entradasPorCategoria.length ? `
+      <div class="section-label">De onde veio</div>
+      ${r.entradasPorCategoria.map(([cat,val])=> catRow(cat, val, r.entradas, "var(--ok)")).join("")}
+    ` : ""}
+
+    ${r.saidasPorCategoria.length ? `
+      <div class="section-label">Para onde foi</div>
+      ${r.saidasPorCategoria.map(([cat,val])=> catRow(cat, val, r.saidas, "var(--critical)")).join("")}
+    ` : ""}
+
+    <div class="section-label">Lançamentos</div>
     <div id="fin-list"></div>
   `;
+
+  c.querySelector("#mes-ant").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym,-1); renderFinanceiro(document.getElementById("content")); });
+  c.querySelector("#mes-prox").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym, 1); renderFinanceiro(document.getElementById("content")); });
+
   const box = c.querySelector("#fin-list");
-  if(list.length===0){
-    box.innerHTML = `<div class="empty"><div class="big">Nada lançado ainda</div><div class="small">Toque no + pra lançar uma entrada ou saída.</div></div>`;
+  if(r.lancamentos.length===0){
+    box.innerHTML = `<div class="empty" style="padding:26px 12px">
+      <div class="small">Nenhum lançamento em ${nomeMes(ym)}.${podeVoltar?" Use a seta pra ver um mês anterior.":" Toque no + pra lançar o primeiro."}</div>
+    </div>`;
     return;
   }
-  box.innerHTML = list.map(f=>`
-    <div class="card" style="cursor:default" data-edit="${f.id}">
-      <div class="card-row">
-        <div><div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(f.descricao||f.categoria)}</div><div class="card-sub">${esc(f.categoria||"—")}${f.pedidoId?" · via pedido":""}</div></div>
-        <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${f.tipo==='Entrada'?'+':'−'} ${fmtMoney(f.valor)}</div>
+
+  // agrupa por dia, mais recente primeiro — dentro do dia, entrada antes de saída
+  const porDia = {};
+  r.lancamentos.forEach(f=>{ (porDia[f.data] = porDia[f.data] || []).push(f); });
+
+  box.innerHTML = Object.keys(porDia).sort().reverse().map(dia=>{
+    const doDia = porDia[dia].slice().sort((a,b)=> (a.tipo==="Entrada"?0:1) - (b.tipo==="Entrada"?0:1));
+    const liquido = doDia.reduce((s,f)=> s + (f.tipo==="Entrada"? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+    return `
+      <div class="section-label" style="margin-top:14px;display:flex;justify-content:space-between">
+        <span>${fmtDate(dia)}</span>
+        <span class="tnum" style="letter-spacing:0;text-transform:none">${liquido>=0?"+":"−"} ${fmtMoney(Math.abs(liquido))}</span>
       </div>
-      <div class="card-meta"><span>${fmtDate(f.data)}</span><span>${esc(f.formaPagamento||"—")}</span></div>
-    </div>
-  `).join("");
+      ${doDia.map(f=>`
+        <div class="card" style="cursor:pointer" data-edit="${f.id}">
+          <div class="card-row">
+            <div>
+              <div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(f.descricao||f.categoria)}</div>
+              <div class="card-sub">${esc(f.categoria||"—")}${f.pedidoId?" · via pedido entregue":""}${f.qtdEntrada?` · +${f.qtdEntrada} no estoque`:""}</div>
+            </div>
+            <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${f.tipo==='Entrada'?'+':'−'} ${fmtMoney(f.valor)}</div>
+          </div>
+          <div class="card-meta"><span>${esc(f.formaPagamento||"—")}</span></div>
+        </div>
+      `).join("")}`;
+  }).join("");
+
   box.querySelectorAll("[data-edit]").forEach(el=> el.addEventListener("click", ()=> openFinanceiroForm(db.financeiro.find(x=>x.id===el.dataset.edit))));
 }
 
@@ -1455,6 +1625,8 @@ function openFinanceiroForm(existing){
 
       if(isEdit){ db.financeiro = db.financeiro.map(f=>f.id===rec.id?rec:f); }
       else{ db.financeiro.push(rec); }
+      // lançamento com data de outro mês sumiria da tela; leva a visão junto
+      state.finMes = rec.data.slice(0,7);
       saveDB(); closeSheet();
       toast(rec.qtdEntrada>0 ? "Lançado — estoque atualizado" : (isEdit?"Lançamento atualizado":"Lançamento criado"));
       render();
