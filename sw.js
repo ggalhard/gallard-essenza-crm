@@ -2,7 +2,10 @@
 // nunca de dado de negócio (esse fica só no localStorage do navegador, nunca
 // passa por aqui). Cache-first com atualização em segundo plano: abre rápido
 // e funciona offline, mas sempre tenta buscar versão nova pra próxima vez.
-const CACHE = "caderno-gallard-v1";
+// Subir esse número a cada mudança no app, senão o celular que já tem o
+// Caderno instalado continua servindo a versão antiga do cache. O activate
+// abaixo apaga todo cache com nome diferente deste.
+const CACHE = "caderno-gallard-v2";
 const ASSETS = [
   "./",
   "./index.html",
