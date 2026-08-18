@@ -361,7 +361,7 @@ p{margin:0}
    uma vez, continua funcionando se a internet cair no meio do uso.
    ============================================================ */
 const DB_KEY = "gallard-crm-db-v1";
-const SCHEMA = 2;
+const SCHEMA = 3;
 const EMPTY_DB = { schema: SCHEMA, clientes: [], pedidos: [], followups: [], estoque: [], financeiro: [] };
 
 /* Compara texto ignorando acento e caixa — "mascara reconstrucao" e
@@ -381,6 +381,22 @@ function normalizar(s){
 function migrar(dbv){
   const de = Number(dbv.schema)||1;
   if(de >= SCHEMA) return dbv;
+
+  // ---- schema 2 -> 3: separa "aconteceu" de "o dinheiro entrou" ----
+  // Antes, todo lançamento contava no saldo na hora. Como entrega e
+  // recebimento podem ser em dias diferentes, agora existe `liquidado`.
+  // Tudo que já existia contava no saldo, então entra como liquidado.
+  if(de >= 2){
+    (dbv.financeiro||[]).forEach(f=>{
+      if(f.liquidado === undefined){
+        f.liquidado = true;
+        f.liquidadoEm = f.data;
+        f.vencimento = null;
+      }
+    });
+    dbv.schema = SCHEMA;
+    return dbv;
+  }
 
   (dbv.clientes||[]).forEach(c=>{
     if(c.bairro !== undefined){
@@ -408,6 +424,12 @@ function migrar(dbv){
 
   (dbv.financeiro||[]).forEach(f=>{
     if(f.estoqueId === undefined){ f.estoqueId = null; f.qtdEntrada = 0; }
+    // vindo do schema 1, tudo que existe já era contado no saldo
+    if(f.liquidado === undefined){
+      f.liquidado = true;
+      f.liquidadoEm = f.data;
+      f.vencimento = null;
+    }
   });
 
   dbv.schema = SCHEMA;
@@ -558,10 +580,27 @@ function computeKPIs(){
     const d = daysSince(f.ultimaInteracao);
     return d!==null && d>7;
   });
-  const saldo = db.financeiro.reduce((s,f)=> s + (f.tipo==="Entrada"? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+  // Saldo é DINHEIRO EM CAIXA: só conta o que foi de fato recebido/pago.
+  // Venda entregue mas ainda não paga não entra aqui — ela aparece em
+  // "a receber", senão o saldo mostraria dinheiro que ainda não chegou.
+  const saldo = db.financeiro
+    .filter(f=>f.liquidado)
+    .reduce((s,f)=> s + (f.tipo==="Entrada"? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+
+  const pendentes = db.financeiro.filter(f=>!f.liquidado);
+  const aReceberLista = pendentes.filter(f=>f.tipo==="Entrada");
+  const aPagarLista = pendentes.filter(f=>f.tipo==="Saída");
+  const aReceber = aReceberLista.reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const aPagar = aPagarLista.reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const hoje = todayISO();
+  const vencidos = aReceberLista.filter(f=> f.vencimento && f.vencimento < hoje);
+  const venceHoje = aReceberLista.filter(f=> f.vencimento === hoje);
+  const aReceberVencido = vencidos.reduce((s,f)=>s+(Number(f.valor)||0),0);
   return {clientesAtivos, leadsNovos, pedidosMes, pedidosMesValidos, faturamentoMes,
           custoMes, lucroMes, estoqueBaixo, estoqueNegativo, valorEstoque,
-          followupsPendentes, followupsAtrasados, saldo};
+          followupsPendentes, followupsAtrasados, saldo,
+          aReceber, aReceberLista, aPagar, aPagarLista,
+          vencidos, venceHoje, aReceberVencido};
 }
 
 /* ============================================================
@@ -600,17 +639,23 @@ function deslocaMes(ym, delta){
    caixa no fim daquele mês", diferente do resultado isolado. */
 function resumoMes(ym){
   const doMes = db.financeiro.filter(f => (f.data||"").slice(0,7) === ym);
-  const entradas = doMes.filter(f=>f.tipo==="Entrada").reduce((s,f)=>s+(Number(f.valor)||0),0);
-  const saidas   = doMes.filter(f=>f.tipo==="Saída").reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const soma = arr => arr.reduce((s,f)=>s+(Number(f.valor)||0),0);
+
+  // "Entrou"/"Saiu" é dinheiro que se moveu de verdade. O que foi
+  // entregue mas ainda não foi pago fica separado, em a receber.
+  const entradas = soma(doMes.filter(f=>f.tipo==="Entrada" && f.liquidado));
+  const saidas   = soma(doMes.filter(f=>f.tipo==="Saída"   && f.liquidado));
+  const aReceberMes = soma(doMes.filter(f=>f.tipo==="Entrada" && !f.liquidado));
+  const aPagarMes   = soma(doMes.filter(f=>f.tipo==="Saída"   && !f.liquidado));
 
   const acumulado = db.financeiro
-    .filter(f => (f.data||"").slice(0,7) <= ym)
+    .filter(f => f.liquidado && (f.data||"").slice(0,7) <= ym)
     .reduce((s,f)=> s + (f.tipo==="Entrada" ? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
 
   // agrupa por categoria, separando o que entrou do que saiu
   const porCategoria = (tipo)=>{
     const mapa = {};
-    doMes.filter(f=>f.tipo===tipo).forEach(f=>{
+    doMes.filter(f=>f.tipo===tipo && f.liquidado).forEach(f=>{
       const cat = f.categoria || "Outro";
       mapa[cat] = (mapa[cat]||0) + (Number(f.valor)||0);
     });
@@ -618,7 +663,7 @@ function resumoMes(ym){
   };
 
   return {
-    ym, lancamentos: doMes, entradas, saidas,
+    ym, lancamentos: doMes, entradas, saidas, aReceberMes, aPagarMes,
     resultado: entradas - saidas,
     acumulado,
     entradasPorCategoria: porCategoria("Entrada"),
@@ -742,8 +787,25 @@ function renderInicio(c){
       <div class="kpi"><div class="v tnum">${fmtMoney(k.valorEstoque)}</div><div class="l">Valor em estoque</div></div>
     </div>
 
-    ${(k.followupsAtrasados.length || k.estoqueBaixo.length || k.estoqueNegativo.length) ? `
+    ${(k.followupsAtrasados.length || k.estoqueBaixo.length || k.estoqueNegativo.length || k.vencidos.length || k.venceHoje.length) ? `
       <div class="section-label">Precisa de atenção</div>
+      ${k.vencidos.map(f=>{
+        const ped = db.pedidos.find(p=>p.id===f.pedidoId);
+        const cli = ped ? getCliente(ped.clienteId) : null;
+        const d = daysSince(f.vencimento);
+        return `<button class="alert-card" data-goto="financeiro"><span class="alert-dot" style="background:var(--critical)"></span>
+          <div><div class="t1">${esc(cli?cli.nome:(f.descricao||"Conta a receber"))} — ${fmtMoney(f.valor)}</div>
+          <div class="t2">atrasado ${d} dia${d>1?"s":""} — combinado pra ${fmtDate(f.vencimento)}</div></div>
+          <span class="chev">${ICONS.chev}</span></button>`;
+      }).join("")}
+      ${k.venceHoje.map(f=>{
+        const ped = db.pedidos.find(p=>p.id===f.pedidoId);
+        const cli = ped ? getCliente(ped.clienteId) : null;
+        return `<button class="alert-card" data-goto="financeiro"><span class="alert-dot" style="background:var(--warn)"></span>
+          <div><div class="t1">${esc(cli?cli.nome:(f.descricao||"Conta a receber"))} — ${fmtMoney(f.valor)}</div>
+          <div class="t2">combinado pra receber hoje</div></div>
+          <span class="chev">${ICONS.chev}</span></button>`;
+      }).join("")}
       ${k.estoqueNegativo.map(e=>`
         <button class="alert-card" data-goto="estoque"><span class="alert-dot" style="background:var(--critical)"></span>
           <div><div class="t1">${esc(e.produto)} — prometido mais do que tem</div><div class="t2">${e.qtd} em estoque, ${comprometido(e.id)} prometido em pedidos pendentes</div></div>
@@ -888,6 +950,10 @@ function pedidoCard(p){
   const map = {"Pendente":"warn","Entregue":"ok","Cancelado":"critical"};
   // pedido antigo (antes do vínculo com estoque) ou produto excluído depois
   const semVinculo = !p.produtoId || !getProduto(p.produtoId);
+  // entregue mas ainda não pago — o lançamento ligado a ele não liquidou
+  const fin = db.financeiro.find(f=>f.pedidoId===p.id);
+  const aReceber = p.status==="Entregue" && fin && !fin.liquidado;
+  const atrasado = aReceber && p.vencimento && p.vencimento < todayISO();
   return `<button class="card" data-pedido="${p.id}">
     <div class="card-row">
       <div>
@@ -897,6 +963,7 @@ function pedidoCard(p){
       <div class="card-right"><div class="card-value tnum">${fmtMoney(total)}</div><span class="badge ${map[p.status]||"neutral"}">${esc(p.status||"—")}</span></div>
     </div>
     ${semVinculo?`<div class="card-meta" style="margin-top:6px"><span style="color:var(--critical)">Sem vínculo com o estoque — abra e escolha o produto</span></div>`:""}
+    ${aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${atrasado?`a receber — atrasado desde ${fmtDate(p.vencimento)}`:(p.vencimento?`a receber até ${fmtDate(p.vencimento)}`:"a receber — sem data combinada")}</span></div>`:""}
     <div class="card-meta">
       <span>${fmtDate(p.data)}</span>
       ${custo>0 && p.status!=="Cancelado" ? `<span>lucro ${fmtMoney(total-custo)}</span>` : `<span>${esc(p.formaPagamento||"—")}</span>`}
@@ -1063,6 +1130,81 @@ function bumpEstoque(id, delta){
 }
 
 /* ---------- FINANCEIRO ---------- */
+/* Marca uma conta como recebida (ou paga). A data de liquidação é hoje,
+   não a data do lançamento — é quando o dinheiro se moveu de verdade. */
+function liquidar(id){
+  const f = db.financeiro.find(x=>x.id===id);
+  if(!f) return;
+  f.liquidado = true;
+  f.liquidadoEm = todayISO();
+  // a partir daqui a data de vencimento não serve mais pra cobrar
+  saveDB();
+  toast(f.tipo==="Entrada" ? "Recebimento confirmado" : "Pagamento confirmado");
+  render();
+}
+
+/* Bloco de contas em aberto — fica no topo do Financeiro porque é a
+   pergunta mais frequente do dia ("quem ainda me deve?"), e porque não
+   pertence a um mês só: vence quando vence. */
+function blocoEmAberto(){
+  const k = computeKPIs();
+  if(k.aReceberLista.length===0 && k.aPagarLista.length===0) return "";
+  const hoje = todayISO();
+
+  const linha = (f)=>{
+    const cli = f.pedidoId ? getCliente((db.pedidos.find(p=>p.id===f.pedidoId)||{}).clienteId) : null;
+    const venc = f.vencimento;
+    const atrasado = venc && venc < hoje;
+    const hojeMesmo = venc === hoje;
+    const dias = venc ? daysSince(venc) : null;
+    const quando = !venc ? "sem data combinada"
+      : atrasado ? `atrasado ${dias} dia${dias>1?"s":""} — venceu ${fmtDate(venc)}`
+      : hojeMesmo ? "vence hoje"
+      : `vence ${fmtDate(venc)}`;
+    return `<div class="card" style="cursor:default">
+      <div class="card-row">
+        <div>
+          <div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(cli?cli.nome:(f.descricao||f.categoria))}</div>
+          <div class="card-sub">${esc(cli ? (f.descricao||"").split(" — ")[0] : (f.categoria||"—"))}</div>
+        </div>
+        <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${fmtMoney(f.valor)}</div>
+      </div>
+      <div class="card-row" style="margin-top:10px;align-items:center;gap:10px">
+        <span class="badge ${atrasado?"critical":hojeMesmo?"warn":"neutral"}">${quando}</span>
+        <button class="btn primary" style="flex:none;padding:8px 14px;font-size:13px" data-liquidar="${f.id}">
+          ${f.tipo==="Entrada"?"Recebi":"Paguei"}
+        </button>
+      </div>
+    </div>`;
+  };
+
+  // vencido primeiro, depois por data; sem data combinada vai pro fim
+  const ordena = (a,b)=>{
+    if(!a.vencimento) return 1;
+    if(!b.vencimento) return -1;
+    return a.vencimento.localeCompare(b.vencimento);
+  };
+
+  return `
+    ${k.aReceberLista.length ? `
+      <div class="section-label" style="display:flex;justify-content:space-between">
+        <span>A receber</span>
+        <span class="tnum" style="letter-spacing:0;text-transform:none;color:var(--ok)">${fmtMoney(k.aReceber)}</span>
+      </div>
+      ${k.aReceberVencido>0?`<p class="hint" style="color:var(--critical);margin:-4px 2px 10px">${fmtMoney(k.aReceberVencido)} já passou da data combinada.</p>`:""}
+      ${k.aReceberLista.slice().sort(ordena).map(linha).join("")}
+    `:""}
+    ${k.aPagarLista.length ? `
+      <div class="section-label" style="display:flex;justify-content:space-between">
+        <span>A pagar</span>
+        <span class="tnum" style="letter-spacing:0;text-transform:none;color:var(--critical)">${fmtMoney(k.aPagar)}</span>
+      </div>
+      ${k.aPagarLista.slice().sort(ordena).map(linha).join("")}
+    `:""}
+    <div class="divider-orn" style="margin:20px 0 4px"></div>
+  `;
+}
+
 function catRow(nome, valor, total, cor){
   const pct = total>0 ? Math.round(valor/total*100) : 0;
   return `<div class="catrow">
@@ -1088,6 +1230,8 @@ function renderFinanceiro(c){
   const temAnterior = anterior.lancamentos.length > 0;
 
   c.innerHTML = `
+    ${blocoEmAberto()}
+
     <div class="mesnav">
       <button id="mes-ant" ${podeVoltar?"":"disabled"} aria-label="Mês anterior">‹</button>
       <div class="rotulo">${nomeMes(ym,true)}<small>${r.lancamentos.length} lançamento(s)</small></div>
@@ -1098,6 +1242,13 @@ function renderFinanceiro(c){
       <div class="kpi"><div class="v tnum" style="color:var(--ok)">${fmtMoney(r.entradas)}</div><div class="l">Entrou no mês</div></div>
       <div class="kpi"><div class="v tnum" style="color:var(--critical)">${fmtMoney(r.saidas)}</div><div class="l">Saiu no mês</div></div>
     </div>
+
+    ${(r.aReceberMes>0 || r.aPagarMes>0) ? `
+      <div class="kpi" style="margin-top:10px">
+        <div class="v tnum" style="font-size:22px">${r.aReceberMes>0?fmtMoney(r.aReceberMes):fmtMoney(r.aPagarMes)}</div>
+        <div class="l">${r.aReceberMes>0?"vendido nesse mês e ainda não recebido":"lançado nesse mês e ainda não pago"}</div>
+      </div>
+    `:""}
 
     <div class="kpi" style="margin-top:10px">
       <div class="v tnum" style="color:${r.resultado>=0?'var(--ok)':'var(--critical)'}">${r.resultado>=0?"+":"−"} ${fmtMoney(Math.abs(r.resultado))}</div>
@@ -1125,6 +1276,7 @@ function renderFinanceiro(c){
 
   c.querySelector("#mes-ant").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym,-1); renderFinanceiro(document.getElementById("content")); });
   c.querySelector("#mes-prox").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym, 1); renderFinanceiro(document.getElementById("content")); });
+  c.querySelectorAll("[data-liquidar]").forEach(b=> b.addEventListener("click", ()=> liquidar(b.dataset.liquidar)));
 
   const box = c.querySelector("#fin-list");
   if(r.lancamentos.length===0){
@@ -1140,11 +1292,14 @@ function renderFinanceiro(c){
 
   box.innerHTML = Object.keys(porDia).sort().reverse().map(dia=>{
     const doDia = porDia[dia].slice().sort((a,b)=> (a.tipo==="Entrada"?0:1) - (b.tipo==="Entrada"?0:1));
-    const liquido = doDia.reduce((s,f)=> s + (f.tipo==="Entrada"? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+    // só o que se moveu de verdade: conta a receber não mexeu no caixa
+    const liquido = doDia.filter(f=>f.liquidado)
+      .reduce((s,f)=> s + (f.tipo==="Entrada"? Number(f.valor)||0 : -(Number(f.valor)||0)), 0);
+    const temPendente = doDia.some(f=>!f.liquidado);
     return `
       <div class="section-label" style="margin-top:14px;display:flex;justify-content:space-between">
         <span>${fmtDate(dia)}</span>
-        <span class="tnum" style="letter-spacing:0;text-transform:none">${liquido>=0?"+":"−"} ${fmtMoney(Math.abs(liquido))}</span>
+        <span class="tnum" style="letter-spacing:0;text-transform:none">${(liquido===0&&temPendente)?"—":`${liquido>=0?"+":"−"} ${fmtMoney(Math.abs(liquido))}`}</span>
       </div>
       ${doDia.map(f=>`
         <div class="card" style="cursor:pointer" data-edit="${f.id}">
@@ -1153,9 +1308,15 @@ function renderFinanceiro(c){
               <div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(f.descricao||f.categoria)}</div>
               <div class="card-sub">${esc(f.categoria||"—")}${f.pedidoId?" · via pedido entregue":""}${f.qtdEntrada?` · +${f.qtdEntrada} no estoque`:""}</div>
             </div>
-            <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${f.tipo==='Entrada'?'+':'−'} ${fmtMoney(f.valor)}</div>
+            <div class="card-right">
+              <div class="card-value tnum" style="color:${f.liquidado?(f.tipo==='Entrada'?'var(--ok)':'var(--critical)'):'var(--ink-faint)'}">${f.tipo==='Entrada'?'+':'−'} ${fmtMoney(f.valor)}</div>
+              ${f.liquidado?"":`<span class="badge ${f.vencimento && f.vencimento<todayISO() ? "critical":"warn"}">${f.tipo==="Entrada"?"a receber":"a pagar"}</span>`}
+            </div>
           </div>
-          <div class="card-meta"><span>${esc(f.formaPagamento||"—")}</span></div>
+          <div class="card-meta">
+            <span>${esc(f.formaPagamento||"—")}</span>
+            ${f.liquidado && f.liquidadoEm && f.liquidadoEm!==f.data ? `<span>recebido em ${fmtDate(f.liquidadoEm)}</span>` : ""}
+          </div>
         </div>
       `).join("")}`;
   }).join("");
@@ -1346,8 +1507,22 @@ function openPedidoForm(existing){
       <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
       <div class="field"><label>Data de entrega</label><input id="f-entrega" type="date" value="${v.dataEntrega||""}"></div>
     </div>
+
+    <div id="rec-box" style="display:none">
+      <div class="field"><label>Recebimento</label>
+        <select id="f-recebi">
+          <option value="sim" ${v.aPrazo?"":"selected"}>Já recebi</option>
+          <option value="nao" ${v.aPrazo?"selected":""}>A receber — combinei pra outro dia</option>
+        </select>
+      </div>
+      <div class="field" id="venc-box" style="display:none">
+        <label>Combinado pra receber em</label>
+        <input id="f-venc" type="date" value="${v.vencimento||""}">
+      </div>
+    </div>
+
     <div class="field"><label>Observações</label><textarea id="f-obs">${esc(v.obs||"")}</textarea></div>
-    <p class="hint">Pedido <b>Pendente</b> reserva a quantidade, mas não tira do estoque. Quando vira <b>Entregue</b>, sai do estoque e entra no Financeiro — tudo de uma vez, sem lançar nada na mão.</p>
+    <p class="hint">Pedido <b>Pendente</b> reserva a quantidade, mas não tira do estoque. Quando vira <b>Entregue</b>, sai do estoque na hora — e o dinheiro só entra no caixa quando você marcar como recebido.</p>
     <div class="btnrow">
       <button class="btn ghost" id="cancel">Cancelar</button>
       <button class="btn primary" id="save">${isEdit?"Salvar":"Lançar pedido"}</button>
@@ -1386,10 +1561,31 @@ function openPedidoForm(existing){
     }
     if(!isEdit) preencheValorDoProduto(); else atualizaDisponivel();
 
+    /* O bloco de recebimento só aparece quando o pedido está Entregue —
+       antes disso não há o que receber. E o campo de data só quando ela
+       escolhe "a receber". */
+    const recBox = root.querySelector("#rec-box"), recEl = root.querySelector("#f-recebi"),
+          vencBox = root.querySelector("#venc-box"), vencEl = root.querySelector("#f-venc");
+    function toggleRecebimento(){
+      recBox.style.display = statusEl.value==="Entregue" ? "block" : "none";
+      const aPrazo = recEl.value==="nao";
+      vencBox.style.display = (statusEl.value==="Entregue" && aPrazo) ? "block" : "none";
+      // sugere uma data em vez de deixar em branco: o caso comum é
+      // combinar pra alguns dias depois da entrega
+      if(aPrazo && !vencEl.value){
+        const base = root.querySelector("#f-entrega").value || root.querySelector("#f-data").value || todayISO();
+        const d = new Date(base+"T00:00:00");
+        d.setDate(d.getDate()+7);
+        vencEl.value = d.toISOString().slice(0,10);
+      }
+    }
+    recEl.addEventListener("change", toggleRecebimento);
+    toggleRecebimento();
+
     prodEl.addEventListener("change", preencheValorDoProduto);
     qtdEl.addEventListener("input", ()=>{ recalc(); atualizaDisponivel(); });
     valEl.addEventListener("input", recalc);
-    statusEl.addEventListener("change", atualizaDisponivel);
+    statusEl.addEventListener("change", ()=>{ atualizaDisponivel(); toggleRecebimento(); });
 
     root.querySelector("#cancel").addEventListener("click", closeSheet);
     if(isEdit) root.querySelector("#del").addEventListener("click", ()=>{
@@ -1417,6 +1613,8 @@ function openPedidoForm(existing){
         dataEntrega: root.querySelector("#f-entrega").value,
         obs: root.querySelector("#f-obs").value.trim(),
         estoqueBaixado: false, qtdBaixada: 0,
+        aPrazo: statusEl.value==="Entregue" && recEl.value==="nao",
+        vencimento: (statusEl.value==="Entregue" && recEl.value==="nao") ? (vencEl.value || null) : null,
       };
 
       // devolve a baixa antiga e aplica a nova — cobre troca de produto,
@@ -1426,19 +1624,32 @@ function openPedidoForm(existing){
       if(isEdit){ db.pedidos = db.pedidos.map(p=>p.id===rec.id?rec:p); }
       else{ db.pedidos.push(rec); }
 
-      // lançamento financeiro segue o status: só existe se estiver Entregue
+      // lançamento financeiro segue o status: só existe se estiver Entregue.
+      // Preserva se já foi marcado como recebido, pra editar o pedido não
+      // "desreceber" um dinheiro que já entrou.
+      const anteriorFin = db.financeiro.find(f=>f.pedidoId===rec.id);
+      // !! obrigatório: sem ele isso vira undefined, e JSON.stringify
+      // descarta chave undefined — o campo sumiria do que fica salvo
+      const jaRecebido = !!(anteriorFin && anteriorFin.liquidado && rec.aPrazo);
       db.financeiro = db.financeiro.filter(f=>f.pedidoId!==rec.id);
       if(rec.status==="Entregue"){
         const cli = getCliente(rec.clienteId);
+        const liquidado = !rec.aPrazo || jaRecebido;
         db.financeiro.push({
-          id: uid(), data: rec.dataEntrega||rec.data, tipo:"Entrada", categoria:"Venda de produto",
+          id: anteriorFin ? anteriorFin.id : uid(),
+          data: rec.dataEntrega||rec.data, tipo:"Entrada", categoria:"Venda de produto",
           descricao: `${rec.produto} — ${cli?cli.nome:""}`, valor: rec.qtd*rec.valorUnit,
           pedidoId: rec.id, formaPagamento: rec.formaPagamento, obs:"",
           estoqueId: null, qtdEntrada: 0,
+          liquidado,
+          liquidadoEm: liquidado ? (jaRecebido ? anteriorFin.liquidadoEm : (rec.dataEntrega||rec.data)) : null,
+          vencimento: rec.aPrazo ? rec.vencimento : null,
         });
       }
       saveDB(); closeSheet();
-      toast(rec.status==="Entregue" ? "Pedido entregue — estoque e caixa atualizados" : (isEdit?"Pedido atualizado":"Pedido lançado"));
+      toast(rec.status!=="Entregue" ? (isEdit?"Pedido atualizado":"Pedido lançado")
+            : rec.aPrazo && !jaRecebido ? `Entregue — a receber${rec.vencimento?" até "+fmtDate(rec.vencimento):""}`
+            : "Pedido entregue — estoque e caixa atualizados");
       render();
     });
   });
@@ -1571,6 +1782,19 @@ function openFinanceiroForm(existing){
       <div class="field"><label>Valor</label><input id="f-valor" type="number" min="0" step="0.01" value="${v.valor??""}"></div>
       <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto","Transferência"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
+
+    <div class="field"><label>O dinheiro já entrou/saiu?</label>
+      <select id="f-liq">
+        <option value="sim" ${(v.liquidado===false)?"":"selected"}>Sim, já foi</option>
+        <option value="nao" ${(v.liquidado===false)?"selected":""}>Ainda não — está em aberto</option>
+      </select>
+    </div>
+    <div class="field" id="venc-box" style="display:none">
+      <label>Combinado para</label>
+      <input id="f-venc" type="date" value="${v.vencimento||""}">
+    </div>
+    <p class="hint" id="liq-hint"></p>
+
     ${v.pedidoId?`<p class="hint">Lançado sozinho a partir de um pedido entregue. Pra mudar valor ou data, edite o pedido — excluir o pedido remove esse lançamento junto.</p>`:""}
     <div class="btnrow">
       <button class="btn ghost" id="cancel">Cancelar</button>
@@ -1591,6 +1815,23 @@ function openFinanceiroForm(existing){
     }
     catEl.addEventListener("change", toggleCompra);
     toggleCompra();
+
+    /* Conta em aberto não entra no saldo — o campo de data só aparece
+       quando faz sentido combinar um prazo. */
+    const liqEl = root.querySelector("#f-liq"), vencBox = root.querySelector("#venc-box"),
+          liqHint = root.querySelector("#liq-hint");
+    function toggleLiquidado(){
+      const emAberto = liqEl.value==="nao";
+      vencBox.style.display = emAberto ? "block" : "none";
+      liqHint.textContent = emAberto
+        ? (tipoEl.value==="Entrada"
+            ? "Vai aparecer em “a receber” e só entra no saldo quando você marcar como recebido."
+            : "Vai aparecer em “a pagar” e só sai do saldo quando você marcar como pago.")
+        : "";
+    }
+    liqEl.addEventListener("change", toggleLiquidado);
+    tipoEl.addEventListener("change", toggleLiquidado);
+    toggleLiquidado();
 
     const delBtn = root.querySelector("#del");
     if(delBtn) delBtn.addEventListener("click", ()=>{
@@ -1619,6 +1860,9 @@ function openFinanceiroForm(existing){
         obs: v.obs||"",
         estoqueId: ehCompra ? (root.querySelector("#f-estoque").value || null) : null,
         qtdEntrada: ehCompra ? (Number(root.querySelector("#f-qtdent").value)||0) : 0,
+        liquidado: liqEl.value==="sim",
+        liquidadoEm: liqEl.value==="sim" ? ((existing && existing.liquidado && existing.liquidadoEm) || root.querySelector("#f-data").value || todayISO()) : null,
+        vencimento: liqEl.value==="nao" ? (root.querySelector("#f-venc").value || null) : null,
       };
 
       reconciliarEstoqueCompra(existing || null, rec);
