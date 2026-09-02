@@ -361,7 +361,7 @@ p{margin:0}
    uma vez, continua funcionando se a internet cair no meio do uso.
    ============================================================ */
 const DB_KEY = "gallard-crm-db-v1";
-const SCHEMA = 3;
+const SCHEMA = 4;
 const EMPTY_DB = { schema: SCHEMA, clientes: [], pedidos: [], followups: [], estoque: [], financeiro: [] };
 
 /* Compara texto ignorando acento e caixa — "mascara reconstrucao" e
@@ -382,54 +382,25 @@ function migrar(dbv){
   const de = Number(dbv.schema)||1;
   if(de >= SCHEMA) return dbv;
 
-  // ---- schema 2 -> 3: separa "aconteceu" de "o dinheiro entrou" ----
-  // Antes, todo lançamento contava no saldo na hora. Como entrega e
-  // recebimento podem ser em dias diferentes, agora existe `liquidado`.
-  // Tudo que já existia contava no saldo, então entra como liquidado.
-  if(de >= 2){
-    (dbv.financeiro||[]).forEach(f=>{
-      if(f.liquidado === undefined){
-        f.liquidado = true;
-        f.liquidadoEm = f.data;
-        f.vencimento = null;
-      }
+  if(de < 2){
+    (dbv.clientes||[]).forEach(c=>{ if(c.bairro !== undefined){ if(!c.rua) c.rua=c.bairro; delete c.bairro; } });
+    (dbv.pedidos||[]).forEach(p=>{
+      if(!p.produtoId && p.produto){ const e=(dbv.estoque||[]).find(x=>normalizar(x.produto)===normalizar(p.produto)); if(e) p.produtoId=e.id; }
+      if(p.custoUnit===undefined){ const e=(dbv.estoque||[]).find(x=>x.id===p.produtoId); p.custoUnit=e?(Number(e.custoUnit)||0):0; }
+      if(p.estoqueBaixado===undefined){ p.estoqueBaixado=false; p.qtdBaixada=0; }
     });
-    dbv.schema = SCHEMA;
-    return dbv;
+    (dbv.financeiro||[]).forEach(f=>{ if(f.estoqueId===undefined){ f.estoqueId=null; f.qtdEntrada=0; } });
   }
-
-  (dbv.clientes||[]).forEach(c=>{
-    if(c.bairro !== undefined){
-      if(!c.rua) c.rua = c.bairro;
-      delete c.bairro;
-    }
-  });
-
+  if(de < 3){
+    (dbv.financeiro||[]).forEach(f=>{ if(f.liquidado===undefined){ f.liquidado=true; f.liquidadoEm=f.data; f.vencimento=null; } });
+  }
+  // schema 3 -> 4: pedidos e compras podem ter vários itens. Os campos
+  // antigos ficam no backup, mas são convertidos sem mudar nenhum valor.
   (dbv.pedidos||[]).forEach(p=>{
-    if(!p.produtoId && p.produto){
-      const achado = (dbv.estoque||[]).find(e=> normalizar(e.produto) === normalizar(p.produto));
-      if(achado) p.produtoId = achado.id;
-    }
-    if(p.custoUnit === undefined){
-      const e = (dbv.estoque||[]).find(x=>x.id===p.produtoId);
-      p.custoUnit = e ? (Number(e.custoUnit)||0) : 0;
-    }
-    // pedidos entregues antes da migração já saíram fisicamente do estoque;
-    // registrar isso evita que a primeira edição devolva quantidade fantasma
-    if(p.estoqueBaixado === undefined){
-      p.estoqueBaixado = false;
-      p.qtdBaixada = 0;
-    }
+    if(!Array.isArray(p.itens)) p.itens=[{produtoId:p.produtoId||null, produto:p.produto||"", custoUnit:Number(p.custoUnit)||0, qtd:Number(p.qtd)||0, valorUnit:Number(p.valorUnit)||0}];
   });
-
   (dbv.financeiro||[]).forEach(f=>{
-    if(f.estoqueId === undefined){ f.estoqueId = null; f.qtdEntrada = 0; }
-    // vindo do schema 1, tudo que existe já era contado no saldo
-    if(f.liquidado === undefined){
-      f.liquidado = true;
-      f.liquidadoEm = f.data;
-      f.vencimento = null;
-    }
+    if(!Array.isArray(f.itensEstoque)) f.itensEstoque=f.estoqueId&&Number(f.qtdEntrada)>0?[{produtoId:f.estoqueId,qtd:Number(f.qtdEntrada)||0,custoUnit:Number(f.custoUnit)||0}]:[];
   });
 
   dbv.schema = SCHEMA;
@@ -471,6 +442,11 @@ function daysSince(iso){
 }
 function getCliente(id){ return db.clientes.find(c=>c.id===id); }
 function getProduto(id){ return db.estoque.find(e=>e.id===id); }
+function pedidoItens(p){ return Array.isArray(p.itens) ? p.itens : [{produtoId:p.produtoId,produto:p.produto,custoUnit:p.custoUnit,qtd:p.qtd,valorUnit:p.valorUnit}]; }
+function pedidoTotal(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0); }
+function pedidoCusto(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.custoUnit)||0),0); }
+function pedidoResumoProdutos(p){ return pedidoItens(p).map(i=>`${i.produto||"Produto sem vínculo"} × ${Number(i.qtd)||0}`).join(", "); }
+function itensCompra(f){ return Array.isArray(f.itensEstoque) ? f.itensEstoque : (f.estoqueId&&f.qtdEntrada?[{produtoId:f.estoqueId,qtd:f.qtdEntrada,custoUnit:f.custoUnit}]:[]); }
 
 /* ============================================================
    ESTOQUE — o vínculo que faltava entre venda, estoque e caixa.
@@ -490,8 +466,8 @@ function getProduto(id){ return db.estoque.find(e=>e.id===id); }
 /* Quanto de um produto está prometido em pedidos ainda não entregues. */
 function comprometido(produtoId, ignorarPedidoId){
   return db.pedidos
-    .filter(p=> p.produtoId===produtoId && p.status==="Pendente" && p.id!==ignorarPedidoId)
-    .reduce((s,p)=> s + (Number(p.qtd)||0), 0);
+    .filter(p=> p.status==="Pendente" && p.id!==ignorarPedidoId)
+    .reduce((s,p)=> s + pedidoItens(p).filter(i=>i.produtoId===produtoId).reduce((a,i)=>a+(Number(i.qtd)||0),0), 0);
 }
 
 /* O que dá pra vender agora: prateleira menos o que já foi prometido. */
@@ -510,39 +486,26 @@ function disponivel(produtoId, ignorarPedidoId){
    de um caso especial pra cada um. */
 function reconciliarEstoquePedido(anterior, atual){
   if(anterior && anterior.estoqueBaixado){
-    const e = getProduto(anterior.produtoId);
-    if(e) e.qtd = (Number(e.qtd)||0) + (Number(anterior.qtdBaixada)||0);
+    pedidoItens(anterior).forEach(i=>{ const e=getProduto(i.produtoId); if(e) e.qtd=(Number(e.qtd)||0)+(Number(i.qtd)||0); });
   }
   if(!atual) return;
-
-  const e = getProduto(atual.produtoId);
-  if(atual.status==="Entregue" && e){
-    e.qtd = (Number(e.qtd)||0) - (Number(atual.qtd)||0);
-    e.atualizadoEm = todayISO();
+  if(atual.status==="Entregue"){
+    pedidoItens(atual).forEach(i=>{ const e=getProduto(i.produtoId); if(e){ e.qtd=(Number(e.qtd)||0)-(Number(i.qtd)||0); e.atualizadoEm=todayISO(); } });
     atual.estoqueBaixado = true;
-    atual.qtdBaixada = Number(atual.qtd)||0;
   }else{
     atual.estoqueBaixado = false;
-    atual.qtdBaixada = 0;
   }
 }
 
 /* Mesma ideia pro caminho inverso: lançamento de "Compra de estoque" no
    Financeiro entra como quantidade na prateleira. */
 function reconciliarEstoqueCompra(anterior, atual){
-  if(anterior && anterior.estoqueId && anterior.qtdEntrada){
-    const e = getProduto(anterior.estoqueId);
-    if(e) e.qtd = (Number(e.qtd)||0) - (Number(anterior.qtdEntrada)||0);
-  }
+  if(anterior) itensCompra(anterior).forEach(i=>{ const e=getProduto(i.produtoId); if(e) e.qtd=(Number(e.qtd)||0)-(Number(i.qtd)||0); });
   if(!atual) return;
-
-  const e = getProduto(atual.estoqueId);
-  if(atual.categoria==="Compra de estoque" && e && Number(atual.qtdEntrada)>0){
-    e.qtd = (Number(e.qtd)||0) + (Number(atual.qtdEntrada)||0);
-    e.atualizadoEm = todayISO();
+  if(atual.categoria==="Compra de estoque"){
+    itensCompra(atual).forEach(i=>{ const e=getProduto(i.produtoId); if(e&&Number(i.qtd)>0){ e.qtd=(Number(e.qtd)||0)+(Number(i.qtd)||0); e.atualizadoEm=todayISO(); } });
   }else{
-    atual.estoqueId = null;
-    atual.qtdEntrada = 0;
+    atual.itensEstoque = [];
   }
 }
 function esc(s){ return (s??"").toString().replace(/[&<>"']/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
@@ -564,8 +527,8 @@ function computeKPIs(){
   // pedido cancelado não é faturamento — contar ele inflava o número e fazia
   // o painel mostrar dinheiro que nunca entrou (corrigido em 2026-08-18)
   const pedidosMesValidos = pedidosMes.filter(p=>p.status!=="Cancelado");
-  const faturamentoMes = pedidosMesValidos.reduce((s,p)=>s+(Number(p.qtd)||0)*(Number(p.valorUnit)||0),0);
-  const custoMes = pedidosMesValidos.reduce((s,p)=>s+(Number(p.qtd)||0)*(Number(p.custoUnit)||0),0);
+  const faturamentoMes = pedidosMesValidos.reduce((s,p)=>s+pedidoTotal(p),0);
+  const custoMes = pedidosMesValidos.reduce((s,p)=>s+pedidoCusto(p),0);
   const lucroMes = faturamentoMes - custoMes;
   // "baixo" agora olha o disponível (prateleira − prometido), não só a
   // prateleira: 8 na estante com 6 já prometidos é estoque baixo de verdade
@@ -791,7 +754,7 @@ function renderInicio(c){
       <div class="section-label">Precisa de atenção</div>
       ${k.vencidos.map(f=>{
         const ped = db.pedidos.find(p=>p.id===f.pedidoId);
-        const cli = ped ? getCliente(ped.clienteId) : null;
+        const cli = getCliente(f.clienteId) || (ped ? getCliente(ped.clienteId) : null);
         const d = daysSince(f.vencimento);
         return `<button class="alert-card" data-goto="financeiro"><span class="alert-dot" style="background:var(--critical)"></span>
           <div><div class="t1">${esc(cli?cli.nome:(f.descricao||"Conta a receber"))} — ${fmtMoney(f.valor)}</div>
@@ -800,7 +763,7 @@ function renderInicio(c){
       }).join("")}
       ${k.venceHoje.map(f=>{
         const ped = db.pedidos.find(p=>p.id===f.pedidoId);
-        const cli = ped ? getCliente(ped.clienteId) : null;
+        const cli = getCliente(f.clienteId) || (ped ? getCliente(ped.clienteId) : null);
         return `<button class="alert-card" data-goto="financeiro"><span class="alert-dot" style="background:var(--warn)"></span>
           <div><div class="t1">${esc(cli?cli.nome:(f.descricao||"Conta a receber"))} — ${fmtMoney(f.valor)}</div>
           <div class="t2">combinado pra receber hoje</div></div>
@@ -896,7 +859,7 @@ function renderClienteDetalhe(c){
 
   const pedidosCliente = db.pedidos.filter(p=>p.clienteId===cl.id).sort((a,b)=>b.data.localeCompare(a.data));
   const followsCliente = db.followups.filter(f=>f.clienteId===cl.id).sort((a,b)=>(b.proximoContato||"").localeCompare(a.proximoContato||""));
-  const totalComprado = pedidosCliente.reduce((s,p)=> s + (Number(p.qtd)||0)*(Number(p.valorUnit)||0), 0);
+  const totalComprado = pedidosCliente.reduce((s,p)=> s + pedidoTotal(p), 0);
 
   c.innerHTML = `
     <div class="card" style="cursor:default">
@@ -945,11 +908,11 @@ function renderClienteDetalhe(c){
 
 function pedidoCard(p){
   const cl = getCliente(p.clienteId);
-  const total = (Number(p.qtd)||0)*(Number(p.valorUnit)||0);
-  const custo = (Number(p.qtd)||0)*(Number(p.custoUnit)||0);
+  const itens = pedidoItens(p);
+  const total = pedidoTotal(p);
+  const custo = pedidoCusto(p);
   const map = {"Pendente":"warn","Entregue":"ok","Cancelado":"critical"};
-  // pedido antigo (antes do vínculo com estoque) ou produto excluído depois
-  const semVinculo = !p.produtoId || !getProduto(p.produtoId);
+  const semVinculo = itens.some(i=>!i.produtoId || !getProduto(i.produtoId));
   // entregue mas ainda não pago — o lançamento ligado a ele não liquidou
   const fin = db.financeiro.find(f=>f.pedidoId===p.id);
   const aReceber = p.status==="Entregue" && fin && !fin.liquidado;
@@ -957,12 +920,12 @@ function pedidoCard(p){
   return `<button class="card" data-pedido="${p.id}">
     <div class="card-row">
       <div>
-        <div class="card-title">${esc(p.produto||"(sem produto)")}</div>
-        <div class="card-sub">${cl?esc(cl.nome):"—"} · ${p.qtd} un</div>
+        <div class="card-title">${esc(pedidoResumoProdutos(p)||"(sem produto)")}</div>
+        <div class="card-sub">${cl?esc(cl.nome):"—"} · ${itens.length} item${itens.length!==1?"s":""}</div>
       </div>
       <div class="card-right"><div class="card-value tnum">${fmtMoney(total)}</div><span class="badge ${map[p.status]||"neutral"}">${esc(p.status||"—")}</span></div>
     </div>
-    ${semVinculo?`<div class="card-meta" style="margin-top:6px"><span style="color:var(--critical)">Sem vínculo com o estoque — abra e escolha o produto</span></div>`:""}
+    ${semVinculo?`<div class="card-meta" style="margin-top:6px"><span style="color:var(--critical)">Há item sem vínculo com o estoque — abra e escolha o produto</span></div>`:""}
     ${aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${atrasado?`a receber — atrasado desde ${fmtDate(p.vencimento)}`:(p.vencimento?`a receber até ${fmtDate(p.vencimento)}`:"a receber — sem data combinada")}</span></div>`:""}
     <div class="card-meta">
       <span>${fmtDate(p.data)}</span>
@@ -1152,7 +1115,7 @@ function blocoEmAberto(){
   const hoje = todayISO();
 
   const linha = (f)=>{
-    const cli = f.pedidoId ? getCliente((db.pedidos.find(p=>p.id===f.pedidoId)||{}).clienteId) : null;
+    const cli = getCliente(f.clienteId) || (f.pedidoId ? getCliente((db.pedidos.find(p=>p.id===f.pedidoId)||{}).clienteId) : null);
     const venc = f.vencimento;
     const atrasado = venc && venc < hoje;
     const hojeMesmo = venc === hoje;
@@ -1165,7 +1128,7 @@ function blocoEmAberto(){
       <div class="card-row">
         <div>
           <div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(cli?cli.nome:(f.descricao||f.categoria))}</div>
-          <div class="card-sub">${esc(cli ? (f.descricao||"").split(" — ")[0] : (f.categoria||"—"))}</div>
+          <div class="card-sub">${esc(f.parcelamentoId?`${f.frequencia} · parcela ${f.parcelaNumero}/${f.totalParcelas}`:(cli ? (f.descricao||"").split(" — ")[0] : (f.categoria||"—")))}</div>
         </div>
         <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${fmtMoney(f.valor)}</div>
       </div>
@@ -1306,7 +1269,7 @@ function renderFinanceiro(c){
           <div class="card-row">
             <div>
               <div class="card-title" style="font-family:inherit;font-size:15px;font-weight:600">${esc(f.descricao||f.categoria)}</div>
-              <div class="card-sub">${esc(f.categoria||"—")}${f.pedidoId?" · via pedido entregue":""}${f.qtdEntrada?` · +${f.qtdEntrada} no estoque`:""}</div>
+              <div class="card-sub">${esc(f.categoria||"—")}${f.pedidoId?" · via pedido entregue":""}${itensCompra(f).length?` · +${itensCompra(f).length} item(ns) no estoque`:""}${f.parcelamentoId?` · parcela ${f.parcelaNumero}/${f.totalParcelas}`:""}</div>
             </div>
             <div class="card-right">
               <div class="card-value tnum" style="color:${f.liquidado?(f.tipo==='Entrada'?'var(--ok)':'var(--critical)'):'var(--ink-faint)'}">${f.tipo==='Entrada'?'+':'−'} ${fmtMoney(f.valor)}</div>
@@ -1482,10 +1445,9 @@ function openPedidoForm(existing){
     setView("estoque"); return;
   }
   const isEdit = !!existing;
-  const v = existing || {data:todayISO(), formaPagamento:"Pix", status:"Pendente",
-                         clienteId: db.clientes[0].id, produtoId: db.estoque[0].id, qtd:1};
-  // produto que não existe mais no estoque (excluído depois do pedido)
-  const produtoSumiu = isEdit && v.produtoId && !getProduto(v.produtoId);
+  const v = existing || {data:todayISO(), formaPagamento:"Pix", status:"Pendente", clienteId:db.clientes[0].id};
+  let itens = existing ? pedidoItens(v).map(i=>({...i})) : [];
+  if(!itens.length) itens=[{produtoId:db.estoque[0].id, produto:db.estoque[0].produto, qtd:1, valorUnit:Number(db.estoque[0].precoVenda)||0, custoUnit:Number(db.estoque[0].custoUnit)||0}];
 
   openSheet(isEdit?"Editar pedido":"Novo pedido", `
     <div class="field"><label>Cliente</label><select id="f-cliente">${clienteOptions(v.clienteId)}</select></div>
@@ -1493,16 +1455,8 @@ function openPedidoForm(existing){
       <div class="field"><label>Data</label><input id="f-data" type="date" value="${v.data}"></div>
       <div class="field"><label>Status</label><select id="f-status">${["Pendente","Entregue","Cancelado"].map(o=>`<option ${v.status===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
-    <div class="field"><label>Produto</label>
-      <select id="f-produto">${produtoOptions(v.produtoId)}</select>
-      <div class="hint" id="f-disp" style="margin-top:6px"></div>
-    </div>
-    ${produtoSumiu?`<p class="hint" style="color:var(--critical)">O produto desse pedido ("${esc(v.produto||"?")}") não está mais no Estoque. Escolha outro acima antes de salvar.</p>`:""}
-    <div class="field-row">
-      <div class="field"><label>Quantidade</label><input id="f-qtd" type="number" min="1" value="${v.qtd??1}"></div>
-      <div class="field"><label>Valor unitário</label><input id="f-valor" type="number" min="0" step="0.01" value="${v.valorUnit??""}"></div>
-    </div>
-    <div class="field"><label>Valor total</label><div class="computed tnum" id="f-total">${fmtMoney((v.qtd||1)*(v.valorUnit||0))}</div></div>
+    <div class="field"><label>Itens do pedido</label><div id="pedido-itens"></div><button class="btn ghost" type="button" id="add-item" style="width:100%;margin-top:8px">+ Adicionar produto</button></div>
+    <div class="field"><label>Valor total</label><div class="computed tnum" id="f-total"></div></div>
     <div class="field-row">
       <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
       <div class="field"><label>Data de entrega</label><input id="f-entrega" type="date" value="${v.dataEntrega||""}"></div>
@@ -1529,37 +1483,22 @@ function openPedidoForm(existing){
     </div>
     ${isEdit?`<button class="btn danger" style="width:100%;margin-top:10px" id="del">Excluir pedido</button>`:""}
   `, root=>{
-    const qtdEl = root.querySelector("#f-qtd"), valEl = root.querySelector("#f-valor"),
-          totEl = root.querySelector("#f-total"), prodEl = root.querySelector("#f-produto"),
-          dispEl = root.querySelector("#f-disp"), statusEl = root.querySelector("#f-status");
-
-    function recalc(){ totEl.textContent = fmtMoney((Number(qtdEl.value)||0)*(Number(valEl.value)||0)); }
-
-    /* Mostra o que sobra de verdade, já descontando o que outros pedidos
-       pendentes prometeram — e avisa quando a quantidade pedida não cabe. */
-    function atualizaDisponivel(){
-      const e = getProduto(prodEl.value);
-      if(!e){ dispEl.textContent = ""; return; }
-      const prom = comprometido(e.id, isEdit?v.id:null);
-      const disp = disponivel(e.id, isEdit?v.id:null);
-      const pedida = Number(qtdEl.value)||0;
-      const falta = pedida - disp;
-      const un = esc(e.unidade||"un");
-      dispEl.innerHTML = falta > 0
-        ? `<span style="color:var(--critical)">Só ${disp} ${un} disponível — faltam ${falta}. Dá pra salvar assim mesmo, mas o estoque fica negativo.</span>`
-        : prom
-          ? `${disp} ${un} disponível — ${e.qtd} em estoque, ${prom} já prometido em outro pedido`
-          : `${disp} ${un} em estoque`;
+    const totEl=root.querySelector("#f-total"), statusEl=root.querySelector("#f-status"), itensBox=root.querySelector("#pedido-itens");
+    function renderItens(){
+      itensBox.innerHTML=itens.map((i,n)=>{
+        const e=getProduto(i.produtoId), disp=e?disponivel(e.id,isEdit?v.id:null):0;
+        const pedida=itens.filter(x=>x.produtoId===i.produtoId).reduce((s,x)=>s+(Number(x.qtd)||0),0);
+        const aviso=e&&pedida>disp?`<div class="hint" style="color:var(--critical)">Só ${disp} ${esc(e.unidade||"un")} disponível — faltam ${pedida-disp}.</div>`:`<div class="hint">${e?`${disp} ${esc(e.unidade||"un")} disponível`:"Escolha um produto do estoque"}</div>`;
+        return `<div class="card" style="cursor:default;padding:12px;margin:8px 0"><div class="field"><label>Produto</label><select data-prod="${n}"><option value="">— selecione —</option>${produtoOptions(i.produtoId)}</select></div><div class="field-row"><div class="field"><label>Quantidade</label><input data-qtd="${n}" type="number" min="1" value="${i.qtd??1}"></div><div class="field"><label>Valor unitário</label><input data-valor="${n}" type="number" min="0" step="0.01" value="${i.valorUnit??""}"></div></div>${aviso}${itens.length>1?`<button class="btn ghost" type="button" data-rem="${n}" style="width:100%;margin-top:4px">Remover item</button>`:""}</div>`;
+      }).join("");
+      itensBox.querySelectorAll("[data-prod]").forEach(el=>el.addEventListener("change",()=>{ const i=itens[el.dataset.prod],e=getProduto(el.value); i.produtoId=el.value; i.produto=e?e.produto:""; i.valorUnit=e?(Number(e.precoVenda)||0):0; i.custoUnit=e?(Number(e.custoUnit)||0):0; renderItens(); }));
+      itensBox.querySelectorAll("[data-qtd]").forEach(el=>el.addEventListener("input",()=>{ itens[el.dataset.qtd].qtd=Number(el.value)||0; atualizaTotal(); renderItens(); }));
+      itensBox.querySelectorAll("[data-valor]").forEach(el=>el.addEventListener("input",()=>{ itens[el.dataset.valor].valorUnit=Number(el.value)||0; atualizaTotal(); }));
+      itensBox.querySelectorAll("[data-rem]").forEach(el=>el.addEventListener("click",()=>{ itens.splice(Number(el.dataset.rem),1); renderItens(); atualizaTotal(); }));
     }
-
-    /* Preço novo puxa do cadastro do produto. Ao editar, respeita o preço
-       que já estava salvo — pode ter sido um desconto combinado. */
-    function preencheValorDoProduto(){
-      const e = getProduto(prodEl.value);
-      if(e) valEl.value = Number(e.precoVenda)||0;
-      recalc(); atualizaDisponivel();
-    }
-    if(!isEdit) preencheValorDoProduto(); else atualizaDisponivel();
+    function atualizaTotal(){ totEl.textContent=fmtMoney(itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0)); }
+    root.querySelector("#add-item").addEventListener("click",()=>{ const e=db.estoque[0]; itens.push({produtoId:e.id,produto:e.produto,qtd:1,valorUnit:Number(e.precoVenda)||0,custoUnit:Number(e.custoUnit)||0}); renderItens(); atualizaTotal(); });
+    renderItens(); atualizaTotal();
 
     /* O bloco de recebimento só aparece quando o pedido está Entregue —
        antes disso não há o que receber. E o campo de data só quando ela
@@ -1582,10 +1521,7 @@ function openPedidoForm(existing){
     recEl.addEventListener("change", toggleRecebimento);
     toggleRecebimento();
 
-    prodEl.addEventListener("change", preencheValorDoProduto);
-    qtdEl.addEventListener("input", ()=>{ recalc(); atualizaDisponivel(); });
-    valEl.addEventListener("input", recalc);
-    statusEl.addEventListener("change", ()=>{ atualizaDisponivel(); toggleRecebimento(); });
+    statusEl.addEventListener("change", toggleRecebimento);
 
     root.querySelector("#cancel").addEventListener("click", closeSheet);
     if(isEdit) root.querySelector("#del").addEventListener("click", ()=>{
@@ -1597,17 +1533,13 @@ function openPedidoForm(existing){
       }
     });
     root.querySelector("#save").addEventListener("click", ()=>{
-      const prod = getProduto(prodEl.value);
-      if(!prod){ alert("Escolha um produto do estoque."); return; }
+      const itensValidos=itens.filter(i=>i.produtoId && Number(i.qtd)>0);
+      if(!itensValidos.length || itensValidos.length!==itens.length || itensValidos.some(i=>!getProduto(i.produtoId))){ alert("Escolha um produto do estoque e uma quantidade para cada item."); return; }
       const rec = {
         id: existing?existing.id:uid(),
         clienteId: root.querySelector("#f-cliente").value,
         data: root.querySelector("#f-data").value || todayISO(),
-        produtoId: prod.id,
-        produto: prod.produto,               // nome guardado junto, pro histórico
-        custoUnit: Number(prod.custoUnit)||0, // custo do dia da venda, pra margem
-        qtd: Number(qtdEl.value)||1,
-        valorUnit: Number(valEl.value)||0,
+        itens: itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,valorUnit:Number(i.valorUnit)||0,custoUnit:Number(i.custoUnit)||0})),
         formaPagamento: root.querySelector("#f-pag").value,
         status: statusEl.value,
         dataEntrega: root.querySelector("#f-entrega").value,
@@ -1638,7 +1570,7 @@ function openPedidoForm(existing){
         db.financeiro.push({
           id: anteriorFin ? anteriorFin.id : uid(),
           data: rec.dataEntrega||rec.data, tipo:"Entrada", categoria:"Venda de produto",
-          descricao: `${rec.produto} — ${cli?cli.nome:""}`, valor: rec.qtd*rec.valorUnit,
+          descricao: `${pedidoResumoProdutos(rec)} — ${cli?cli.nome:""}`, valor: pedidoTotal(rec),
           pedidoId: rec.id, formaPagamento: rec.formaPagamento, obs:"",
           estoqueId: null, qtdEntrada: 0,
           liquidado,
@@ -1725,7 +1657,7 @@ function openEstoqueForm(existing){
     if(isEdit) root.querySelector("#del").addEventListener("click", ()=>{
       // pedido que aponta pra um produto apagado fica órfão e some do
       // relatório — avisar antes, com o número real, em vez de deixar quebrar
-      const ligados = db.pedidos.filter(p=>p.produtoId===existing.id);
+      const ligados = db.pedidos.filter(p=>pedidoItens(p).some(i=>i.produtoId===existing.id));
       const pendentes = ligados.filter(p=>p.status==="Pendente").length;
       if(ligados.length){
         const ok = confirm(
@@ -1759,24 +1691,36 @@ function openEstoqueForm(existing){
 
 function openFinanceiroForm(existing){
   const isEdit = !!existing;
+  if(existing && existing.parcelamentoId){
+    const cli=getCliente(existing.clienteId), parcelas=db.financeiro.filter(f=>f.parcelamentoId===existing.parcelamentoId);
+    openSheet("Parcelamento", `<p class="hint"><b>${esc(cli?cli.nome:"Cliente removido")}</b> · ${esc(existing.frequencia||"recorrente")} · ${parcelas.filter(f=>!f.liquidado).length} parcela(s) em aberto de ${parcelas.length}.</p><p class="hint">Cada parcela aparece em “A receber” na data combinada. Use <b>Recebi</b> para confirmar uma parcela; as outras continuam agendadas.</p><div class="btnrow"><button class="btn ghost" id="cancel">Voltar</button></div><button class="btn danger" id="del-plan" style="width:100%;margin-top:10px">Excluir todas as parcelas deste combinado</button>`, root=>{
+      root.querySelector("#cancel").addEventListener("click",closeSheet);
+      root.querySelector("#del-plan").addEventListener("click",()=>{ if(confirm("Excluir todas as parcelas deste combinado? As já recebidas também serão removidas do histórico.")){ db.financeiro=db.financeiro.filter(f=>f.parcelamentoId!==existing.parcelamentoId); saveDB(); closeSheet(); toast("Parcelamento excluído"); render(); } });
+    });
+    return;
+  }
   const v = existing || {data:todayISO(), tipo:"Entrada", categoria:"Venda de produto", formaPagamento:"Pix"};
+  let compraItens=itensCompra(v).map(i=>({...i}));
   openSheet(isEdit?"Editar lançamento":"Novo lançamento", `
     <div class="field-row">
       <div class="field"><label>Data</label><input id="f-data" type="date" value="${v.data}"></div>
       <div class="field"><label>Tipo</label><select id="f-tipo">${["Entrada","Saída"].map(o=>`<option ${v.tipo===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
-    <div class="field"><label>Categoria</label><select id="f-cat">${["Venda de produto","Compra de estoque","Despesa fixa","Despesa variável","Outro"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
+    <div class="field"><label>Categoria</label><select id="f-cat">${["Venda de produto","Compra de estoque","Parcelamento de cliente","Despesa fixa","Despesa variável","Outro"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
 
     <div id="compra-box" style="display:none">
-      <div class="field-row">
-        <div class="field"><label>Produto que entrou</label>
-          <select id="f-estoque">${db.estoque.length?produtoOptions(v.estoqueId):`<option value="">— nenhum produto cadastrado —</option>`}</select>
-        </div>
-        <div class="field"><label>Qtd. que entrou</label><input id="f-qtdent" type="number" min="0" value="${v.qtdEntrada||0}"></div>
-      </div>
-      <p class="hint">Essa quantidade entra no Estoque assim que você salvar. Deixe em 0 se for uma compra que não é pra revenda.</p>
+      <div class="field"><label>Itens que entraram</label><div id="compra-itens"></div><button class="btn ghost" type="button" id="add-compra" style="width:100%;margin-top:8px">+ Adicionar produto</button></div>
+      <p class="hint">Cada item entra no Estoque ao salvar. O custo de cada um forma o valor total desta compra.</p>
     </div>
 
+    <div id="parcel-box" style="display:none">
+      <div class="field"><label>Cliente</label><select id="f-parcel-cli">${clienteOptions(v.clienteId)}</select></div>
+      <div class="field-row"><div class="field"><label>Valor total devido</label><input id="f-parcel-total" type="number" min="0" step="0.01"></div><div class="field"><label>Valor de cada parcela</label><input id="f-parcel-valor" type="number" min="0" step="0.01"></div></div>
+      <div class="field-row"><div class="field"><label>Frequência</label><select id="f-parcel-freq"><option value="7">Semanal</option><option value="15">A cada 15 dias</option></select></div><div class="field"><label>Primeiro vencimento</label><input id="f-parcel-venc" type="date" value="${todayISO()}"></div></div>
+      <p class="hint" id="parcel-previa">Uma conta a receber será criada para cada parcela.</p>
+    </div>
+
+    <div id="generico-box">
     <div class="field"><label>Descrição</label><input id="f-desc" value="${esc(v.descricao||"")}"></div>
     <div class="field-row">
       <div class="field"><label>Valor</label><input id="f-valor" type="number" min="0" step="0.01" value="${v.valor??""}"></div>
@@ -1794,6 +1738,7 @@ function openFinanceiroForm(existing){
       <input id="f-venc" type="date" value="${v.vencimento||""}">
     </div>
     <p class="hint" id="liq-hint"></p>
+    </div>
 
     ${v.pedidoId?`<p class="hint">Lançado sozinho a partir de um pedido entregue. Pra mudar valor ou data, edite o pedido — excluir o pedido remove esse lançamento junto.</p>`:""}
     <div class="btnrow">
@@ -1804,7 +1749,7 @@ function openFinanceiroForm(existing){
   `, root=>{
     root.querySelector("#cancel").addEventListener("click", closeSheet);
     const catEl = root.querySelector("#f-cat"), tipoEl = root.querySelector("#f-tipo"),
-          box = root.querySelector("#compra-box");
+          box = root.querySelector("#compra-box"), parcelBox=root.querySelector("#parcel-box"), genericoBox=root.querySelector("#generico-box"), valorEl=root.querySelector("#f-valor"), compraBox=root.querySelector("#compra-itens");
 
     /* O bloco de entrada de estoque só faz sentido em compra de estoque —
        aparecer sempre só confundiria. */
@@ -1812,9 +1757,36 @@ function openFinanceiroForm(existing){
       const ehCompra = catEl.value==="Compra de estoque";
       box.style.display = ehCompra ? "block" : "none";
       if(ehCompra && tipoEl.value!=="Saída") tipoEl.value = "Saída";
+      valorEl.readOnly=ehCompra;
+      if(ehCompra) atualizaCompraTotal();
     }
+    function renderCompraItens(){
+      compraBox.innerHTML=compraItens.map((i,n)=>`<div class="card" style="cursor:default;padding:12px;margin:8px 0"><div class="field"><label>Produto</label><select data-cprod="${n}"><option value="">— selecione —</option>${produtoOptions(i.produtoId)}</select></div><div class="field-row"><div class="field"><label>Quantidade</label><input data-cqtd="${n}" type="number" min="1" value="${i.qtd??1}"></div><div class="field"><label>Custo unitário</label><input data-ccusto="${n}" type="number" min="0" step="0.01" value="${i.custoUnit??""}"></div></div>${compraItens.length>1?`<button class="btn ghost" type="button" data-crem="${n}" style="width:100%;margin-top:4px">Remover item</button>`:""}</div>`).join("");
+      compraBox.querySelectorAll("[data-cprod]").forEach(el=>el.addEventListener("change",()=>{ const i=compraItens[el.dataset.cprod],e=getProduto(el.value); i.produtoId=el.value; i.produto=e?e.produto:""; i.custoUnit=e?(Number(e.custoUnit)||0):0; renderCompraItens(); atualizaCompraTotal(); }));
+      compraBox.querySelectorAll("[data-cqtd]").forEach(el=>el.addEventListener("input",()=>{ compraItens[el.dataset.cqtd].qtd=Number(el.value)||0; atualizaCompraTotal(); }));
+      compraBox.querySelectorAll("[data-ccusto]").forEach(el=>el.addEventListener("input",()=>{ compraItens[el.dataset.ccusto].custoUnit=Number(el.value)||0; atualizaCompraTotal(); }));
+      compraBox.querySelectorAll("[data-crem]").forEach(el=>el.addEventListener("click",()=>{ compraItens.splice(Number(el.dataset.crem),1); renderCompraItens(); atualizaCompraTotal(); }));
+    }
+    function atualizaCompraTotal(){ valorEl.value=compraItens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.custoUnit)||0),0).toFixed(2); }
+    root.querySelector("#add-compra").addEventListener("click",()=>{ const e=db.estoque[0]; if(!e){ alert("Cadastre um produto no Estoque primeiro."); return; } compraItens.push({produtoId:e.id,produto:e.produto,qtd:1,custoUnit:Number(e.custoUnit)||0}); renderCompraItens(); atualizaCompraTotal(); });
+    renderCompraItens();
+    function toggleParcelamento(){
+      const ehParcel=catEl.value==="Parcelamento de cliente";
+      parcelBox.style.display=ehParcel?"block":"none";
+      genericoBox.style.display=ehParcel?"none":"block";
+      if(ehParcel){ tipoEl.value="Entrada"; valorEl.readOnly=true; root.querySelector("#f-liq").value="nao"; }
+      if(!ehParcel) valorEl.readOnly=catEl.value==="Compra de estoque";
+    }
+    function atualizaPreviaParcelas(){
+      const total=Number(root.querySelector("#f-parcel-total").value)||0, parcela=Number(root.querySelector("#f-parcel-valor").value)||0;
+      root.querySelector("#parcel-previa").textContent=total>0&&parcela>0?`${Math.ceil(total/parcela)} parcela(s): a última ajusta o restante automaticamente.`:"Informe total e valor da parcela para ver o combinado.";
+    }
+    root.querySelector("#f-parcel-total").addEventListener("input",atualizaPreviaParcelas);
+    root.querySelector("#f-parcel-valor").addEventListener("input",atualizaPreviaParcelas);
     catEl.addEventListener("change", toggleCompra);
+    catEl.addEventListener("change", toggleParcelamento);
     toggleCompra();
+    toggleParcelamento();
 
     /* Conta em aberto não entra no saldo — o campo de data só aparece
        quando faz sentido combinar um prazo. */
@@ -1835,7 +1807,7 @@ function openFinanceiroForm(existing){
 
     const delBtn = root.querySelector("#del");
     if(delBtn) delBtn.addEventListener("click", ()=>{
-      const temEstoque = existing.estoqueId && Number(existing.qtdEntrada)>0;
+      const temEstoque = itensCompra(existing).some(i=>Number(i.qtd)>0);
       if(confirm(temEstoque
         ? "Excluir esse lançamento? A quantidade que ele tinha colocado no estoque será removida de volta."
         : "Excluir esse lançamento?")){
@@ -1845,9 +1817,25 @@ function openFinanceiroForm(existing){
       }
     });
     root.querySelector("#save").addEventListener("click", ()=>{
+      const ehCompra = catEl.value==="Compra de estoque";
+      const ehParcelamento = catEl.value==="Parcelamento de cliente";
+      if(ehParcelamento){
+        const total=Number(root.querySelector("#f-parcel-total").value)||0, parcela=Number(root.querySelector("#f-parcel-valor").value)||0;
+        const clienteId=root.querySelector("#f-parcel-cli").value, intervalo=Number(root.querySelector("#f-parcel-freq").value), primeiro=root.querySelector("#f-parcel-venc").value;
+        if(!clienteId || total<=0 || parcela<=0 || !primeiro){ alert("Informe cliente, total, valor da parcela e primeiro vencimento."); return; }
+        const planoId=uid(), cli=getCliente(clienteId), quantidade=Math.ceil(total/parcela);
+        let restante=total;
+        for(let n=0;n<quantidade;n++){
+          const valorParcela=Math.min(parcela,restante), d=new Date(primeiro+"T00:00:00"); d.setDate(d.getDate()+n*intervalo); const venc=d.toISOString().slice(0,10);
+          db.financeiro.push({id:uid(),data:venc,tipo:"Entrada",categoria:"Parcelamento de cliente",descricao:`Parcelamento — ${cli?cli.nome:"cliente"}`,valor:valorParcela,formaPagamento:root.querySelector("#f-pag").value,pedidoId:null,clienteId,parcelamentoId:planoId,parcelaNumero:n+1,totalParcelas:quantidade,frequencia:intervalo===7?"semanal":"a cada 15 dias",liquidado:false,liquidadoEm:null,vencimento:venc,itensEstoque:[]});
+          restante-=valorParcela;
+        }
+        state.finMes=primeiro.slice(0,7); saveDB(); closeSheet(); toast(`${quantidade} parcela(s) lançada(s) em A receber`); render(); return;
+      }
       const valor = Number(root.querySelector("#f-valor").value)||0;
       if(valor<=0){ alert("Informe um valor maior que zero."); return; }
-      const ehCompra = catEl.value==="Compra de estoque";
+      const itensValidos=ehCompra?compraItens.filter(i=>i.produtoId&&Number(i.qtd)>0):[];
+      if(ehCompra && (!itensValidos.length || itensValidos.length!==compraItens.length)){ alert("Escolha produto e quantidade para todos os itens da compra."); return; }
       const rec = {
         id: existing?existing.id:uid(),
         data: root.querySelector("#f-data").value || todayISO(),
@@ -1858,8 +1846,7 @@ function openFinanceiroForm(existing){
         formaPagamento: root.querySelector("#f-pag").value,
         pedidoId: v.pedidoId || null,
         obs: v.obs||"",
-        estoqueId: ehCompra ? (root.querySelector("#f-estoque").value || null) : null,
-        qtdEntrada: ehCompra ? (Number(root.querySelector("#f-qtdent").value)||0) : 0,
+        itensEstoque: ehCompra ? itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,custoUnit:Number(i.custoUnit)||0})) : [],
         liquidado: liqEl.value==="sim",
         liquidadoEm: liqEl.value==="sim" ? ((existing && existing.liquidado && existing.liquidadoEm) || root.querySelector("#f-data").value || todayISO()) : null,
         vencimento: liqEl.value==="nao" ? (root.querySelector("#f-venc").value || null) : null,
@@ -1872,7 +1859,7 @@ function openFinanceiroForm(existing){
       // lançamento com data de outro mês sumiria da tela; leva a visão junto
       state.finMes = rec.data.slice(0,7);
       saveDB(); closeSheet();
-      toast(rec.qtdEntrada>0 ? "Lançado — estoque atualizado" : (isEdit?"Lançamento atualizado":"Lançamento criado"));
+      toast(rec.itensEstoque.length ? "Lançado — estoque atualizado" : (isEdit?"Lançamento atualizado":"Lançamento criado"));
       render();
     });
   });
