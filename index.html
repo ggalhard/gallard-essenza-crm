@@ -424,7 +424,14 @@ function saveDB(){ localStorage.setItem(DB_KEY, JSON.stringify(db)); }
 let db = loadDB();
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+/* new Date().toISOString() devolve a data em UTC — no Brasil (UTC-3),
+   entre 21h e meia-noite locais isso já é "amanhã", e todo pedido ou
+   lançamento feito nesse intervalo saía com a data errada. Os getters
+   locais (getFullYear/getMonth/getDate) não têm esse problema. */
+function todayISO(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
 function fmtDate(iso){
   if(!iso) return "—";
   const [y,m,d] = iso.split("-");
@@ -1693,8 +1700,38 @@ function openFinanceiroForm(existing){
   const isEdit = !!existing;
   if(existing && existing.parcelamentoId){
     const cli=getCliente(existing.clienteId), parcelas=db.financeiro.filter(f=>f.parcelamentoId===existing.parcelamentoId);
-    openSheet("Parcelamento", `<p class="hint"><b>${esc(cli?cli.nome:"Cliente removido")}</b> · ${esc(existing.frequencia||"recorrente")} · ${parcelas.filter(f=>!f.liquidado).length} parcela(s) em aberto de ${parcelas.length}.</p><p class="hint">Cada parcela aparece em “A receber” na data combinada. Use <b>Recebi</b> para confirmar uma parcela; as outras continuam agendadas.</p><div class="btnrow"><button class="btn ghost" id="cancel">Voltar</button></div><button class="btn danger" id="del-plan" style="width:100%;margin-top:10px">Excluir todas as parcelas deste combinado</button>`, root=>{
+    openSheet(`Parcela ${existing.parcelaNumero}/${existing.totalParcelas}`, `
+      <p class="hint"><b>${esc(cli?cli.nome:"Cliente removido")}</b> · ${esc(existing.frequencia||"recorrente")} · ${parcelas.filter(f=>!f.liquidado).length} parcela(s) em aberto de ${parcelas.length}.</p>
+      <div class="field-row">
+        <div class="field"><label>Vencimento</label><input id="f-pvenc" type="date" value="${existing.vencimento||existing.data}" ${existing.liquidado?"disabled":""}></div>
+        <div class="field"><label>Valor</label><input id="f-pvalor" type="number" min="0" step="0.01" value="${existing.valor??""}" ${existing.liquidado?"disabled":""}></div>
+      </div>
+      ${existing.liquidado?`<p class="hint">Já recebida em ${fmtDate(existing.liquidadoEm)} — data e valor ficam travados pra não desencontrar do que já entrou no caixa.</p>`:`<p class="hint">Mudar o valor desta parcela não redistribui as outras — se o total combinado deixar de bater, é pra ajustar na mão.</p>`}
+      <div class="btnrow">
+        <button class="btn ghost" id="cancel">Voltar</button>
+        ${existing.liquidado?"":`<button class="btn primary" id="save-parcela">Salvar</button>`}
+      </div>
+      <button class="btn danger" id="del-parcela" style="width:100%;margin-top:10px">Excluir esta parcela</button>
+      <button class="btn danger" id="del-plan" style="width:100%;margin-top:10px">Excluir todas as parcelas deste combinado</button>
+    `, root=>{
       root.querySelector("#cancel").addEventListener("click",closeSheet);
+      const saveBtn = root.querySelector("#save-parcela");
+      if(saveBtn) saveBtn.addEventListener("click",()=>{
+        const venc = root.querySelector("#f-pvenc").value;
+        const valor = Number(root.querySelector("#f-pvalor").value)||0;
+        if(!venc){ alert("Informe o vencimento."); return; }
+        if(valor<=0){ alert("Informe um valor maior que zero."); return; }
+        existing.vencimento = venc;
+        existing.data = venc;
+        existing.valor = valor;
+        saveDB(); closeSheet(); toast("Parcela atualizada"); render();
+      });
+      root.querySelector("#del-parcela").addEventListener("click",()=>{
+        if(confirm(existing.liquidado ? "Essa parcela já foi recebida — excluir mesmo assim? Ela some do histórico." : "Excluir esta parcela?")){
+          db.financeiro=db.financeiro.filter(f=>f.id!==existing.id);
+          saveDB(); closeSheet(); toast("Parcela excluída"); render();
+        }
+      });
       root.querySelector("#del-plan").addEventListener("click",()=>{ if(confirm("Excluir todas as parcelas deste combinado? As já recebidas também serão removidas do histórico.")){ db.financeiro=db.financeiro.filter(f=>f.parcelamentoId!==existing.parcelamentoId); saveDB(); closeSheet(); toast("Parcelamento excluído"); render(); } });
     });
     return;
