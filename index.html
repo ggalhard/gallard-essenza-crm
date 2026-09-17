@@ -490,7 +490,15 @@ function deslocaData(iso, dias){
 }
 function getProduto(id){ return db.estoque.find(e=>e.id===id); }
 function pedidoItens(p){ return Array.isArray(p.itens) ? p.itens : [{produtoId:p.produtoId,produto:p.produto,custoUnit:p.custoUnit,qtd:p.qtd,valorUnit:p.valorUnit}]; }
-function pedidoTotal(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0); }
+/* Soma dos itens, sem desconto — é sobre esse valor que o desconto do
+   pedido é calculado (em R$ direto, ou em % convertido na hora de
+   salvar — ver openPedidoForm). */
+function pedidoSubtotal(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0); }
+/* Valor de verdade cobrado do cliente — todo o resto do app (Financeiro,
+   parcelas, KPIs, dashboard) lê daqui, então o desconto propaga sozinho
+   sem precisar mexer em cada lugar que soma pedido. Nunca fica negativo:
+   desconto maior que o subtotal é travado no próprio subtotal. */
+function pedidoTotal(p){ return Math.max(0, pedidoSubtotal(p) - (Number(p.desconto)||0)); }
 function pedidoCusto(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.custoUnit)||0),0); }
 function pedidoResumoProdutos(p){ return pedidoItens(p).map(i=>`${i.produto||"Produto sem vínculo"} × ${Number(i.qtd)||0}`).join(", "); }
 function itensCompra(f){ return Array.isArray(f.itensEstoque) ? f.itensEstoque : (f.estoqueId&&f.qtdEntrada?[{produtoId:f.estoqueId,qtd:f.qtdEntrada,custoUnit:f.custoUnit}]:[]); }
@@ -1113,6 +1121,7 @@ function pedidoCard(p){
       <div class="card-right"><div class="card-value tnum">${fmtMoney(total)}</div><span class="badge ${map[p.status]||"neutral"}">${esc(p.status||"—")}</span></div>
     </div>
     ${semVinculo?`<div class="card-meta" style="margin-top:6px"><span style="color:var(--critical)">Há item sem vínculo com o estoque — abra e escolha o produto</span></div>`:""}
+    ${Number(p.desconto)>0?`<div class="card-meta" style="margin-top:6px"><span>desconto de ${fmtMoney(p.desconto)} sobre ${fmtMoney(pedidoSubtotal(p))}</span></div>`:""}
     ${parcelado && aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${esc(resumoParcelas)}${atrasado?" — atrasada":""}</span></div>`:""}
     ${!parcelado && aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${atrasado?`a receber — atrasado desde ${fmtDate(p.vencimento)}`:(p.vencimento?`a receber até ${fmtDate(p.vencimento)}`:"a receber — sem data combinada")}</span></div>`:""}
     <div class="card-meta">
@@ -1791,6 +1800,12 @@ function openPedidoForm(existing){
       <div class="field"><label>Status</label><select id="f-status">${["Pendente","Entregue","Cancelado"].map(o=>`<option ${v.status===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
     <div class="field"><label>Itens do pedido</label><div id="pedido-itens"></div><button class="btn ghost" type="button" id="add-item" style="width:100%;margin-top:8px">+ Adicionar produto</button></div>
+    <div class="field"><label>Subtotal</label><div class="computed tnum" id="f-subtotal"></div></div>
+    <div class="field-row">
+      <div class="field"><label>Desconto</label><input id="f-desconto" type="number" min="0" step="0.01" value="${v.desconto>0?v.desconto:""}" placeholder="0,00"></div>
+      <div class="field"><label>Tipo</label><select id="f-desconto-tipo"><option value="valor">R$</option><option value="pct">%</option></select></div>
+    </div>
+    <p class="hint" id="desconto-nota" style="margin-top:-6px">Sem desconto neste pedido.</p>
     <div class="field"><label>Valor total</label><div class="computed tnum" id="f-total"></div></div>
     <div class="field-row">
       <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto","Parcelado personalizado"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
@@ -1828,7 +1843,10 @@ function openPedidoForm(existing){
     </div>
     ${isEdit?`<button class="btn danger" style="width:100%;margin-top:10px" id="del">Excluir pedido</button>`:""}
   `, root=>{
-    const totEl=root.querySelector("#f-total"), statusEl=root.querySelector("#f-status"), itensBox=root.querySelector("#pedido-itens");
+    const totEl=root.querySelector("#f-total"), subtotalEl=root.querySelector("#f-subtotal"),
+          statusEl=root.querySelector("#f-status"), itensBox=root.querySelector("#pedido-itens"),
+          descontoEl=root.querySelector("#f-desconto"), descontoTipoEl=root.querySelector("#f-desconto-tipo"),
+          descontoNota=root.querySelector("#desconto-nota");
 
     /* Declarado antes de renderItens/atualizaTotal de propósito: os dois
        chamam atualizaPreviaParcelaPedido(), que lê estes campos — se essa
@@ -1841,8 +1859,19 @@ function openPedidoForm(existing){
           ppValorEl = root.querySelector("#f-pp-valor"), ppVencEl = root.querySelector("#f-pp-venc"),
           ppPrevia = root.querySelector("#parcel-ped-previa");
     function ehParcelado(){ return pagEl.value==="Parcelado personalizado"; }
+
+    /* Desconto sempre guardado em R$ no pedido (ver pedidoTotal); o campo
+       "Tipo" só decide como o número digitado aqui é convertido na hora
+       de calcular — % é sobre o subtotal, nunca sobre um desconto já
+       aplicado antes. Nunca deixa o total ficar negativo. */
+    function subtotalAtual(){ return itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0); }
+    function descontoAtualRS(){
+      const subtotal = subtotalAtual(), digitado = Number(descontoEl.value)||0;
+      const bruto = descontoTipoEl.value==="pct" ? subtotal*(digitado/100) : digitado;
+      return Math.min(subtotal, Math.max(0, bruto));
+    }
     function atualizaPreviaParcelaPedido(){
-      const total = itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0);
+      const total = Math.max(0, subtotalAtual()-descontoAtualRS());
       const valorParcela = Number(ppValorEl.value)||0;
       ppPrevia.textContent = (total>0 && valorParcela>0)
         ? `${Math.ceil(total/valorParcela)} parcela(s) de ${fmtMoney(valorParcela)} pra fechar ${fmtMoney(total)} — a última ajusta o restante.`
@@ -1856,13 +1885,23 @@ function openPedidoForm(existing){
         const aviso=e&&pedida>disp?`<div class="hint" style="color:var(--critical)">Só ${disp} ${esc(e.unidade||"un")} disponível — faltam ${pedida-disp}.</div>`:`<div class="hint">${e?`${disp} ${esc(e.unidade||"un")} disponível`:"Escolha um produto do estoque"}</div>`;
         return `<div class="card" style="cursor:default;padding:12px;margin:8px 0"><div class="field"><label>Produto</label><select data-prod="${n}"><option value="">— selecione —</option>${produtoOptions(i.produtoId)}</select></div><div class="field-row"><div class="field"><label>Quantidade</label><input data-qtd="${n}" type="number" min="1" value="${i.qtd??1}"></div><div class="field"><label>Valor unitário</label><input data-valor="${n}" type="number" min="0" step="0.01" value="${i.valorUnit??""}"></div></div>${aviso}${itens.length>1?`<button class="btn ghost" type="button" data-rem="${n}" style="width:100%;margin-top:4px">Remover item</button>`:""}</div>`;
       }).join("");
-      itensBox.querySelectorAll("[data-prod]").forEach(el=>el.addEventListener("change",()=>{ const i=itens[el.dataset.prod],e=getProduto(el.value); i.produtoId=el.value; i.produto=e?e.produto:""; i.valorUnit=e?(Number(e.precoVenda)||0):0; i.custoUnit=e?(Number(e.custoUnit)||0):0; renderItens(); }));
+      itensBox.querySelectorAll("[data-prod]").forEach(el=>el.addEventListener("change",()=>{ const i=itens[el.dataset.prod],e=getProduto(el.value); i.produtoId=el.value; i.produto=e?e.produto:""; i.valorUnit=e?(Number(e.precoVenda)||0):0; i.custoUnit=e?(Number(e.custoUnit)||0):0; renderItens(); atualizaTotal(); }));
       itensBox.querySelectorAll("[data-qtd]").forEach(el=>el.addEventListener("input",()=>{ itens[el.dataset.qtd].qtd=Number(el.value)||0; atualizaTotal(); renderItens(); }));
       itensBox.querySelectorAll("[data-valor]").forEach(el=>el.addEventListener("input",()=>{ itens[el.dataset.valor].valorUnit=Number(el.value)||0; atualizaTotal(); }));
       itensBox.querySelectorAll("[data-rem]").forEach(el=>el.addEventListener("click",()=>{ itens.splice(Number(el.dataset.rem),1); renderItens(); atualizaTotal(); }));
     }
-    function atualizaTotal(){ totEl.textContent=fmtMoney(itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0)); if(typeof atualizaPreviaParcelaPedido==="function") atualizaPreviaParcelaPedido(); }
+    function atualizaTotal(){
+      const subtotal = subtotalAtual(), desc = descontoAtualRS();
+      subtotalEl.textContent = fmtMoney(subtotal);
+      totEl.textContent = fmtMoney(Math.max(0, subtotal-desc));
+      descontoNota.textContent = desc>0
+        ? `Desconto de ${fmtMoney(desc)}${subtotal>0?` (${Math.round(desc/subtotal*100)}% do subtotal)`:""}.`
+        : "Sem desconto neste pedido.";
+      if(typeof atualizaPreviaParcelaPedido==="function") atualizaPreviaParcelaPedido();
+    }
     root.querySelector("#add-item").addEventListener("click",()=>{ const e=db.estoque[0]; itens.push({produtoId:e.id,produto:e.produto,qtd:1,valorUnit:Number(e.precoVenda)||0,custoUnit:Number(e.custoUnit)||0}); renderItens(); atualizaTotal(); });
+    descontoEl.addEventListener("input", atualizaTotal);
+    descontoTipoEl.addEventListener("change", atualizaTotal);
     renderItens(); atualizaTotal();
 
     /* O bloco de recebimento só aparece quando o pedido está Entregue —
@@ -1918,6 +1957,7 @@ function openPedidoForm(existing){
         clienteId: root.querySelector("#f-cliente").value,
         data: root.querySelector("#f-data").value || todayISO(),
         itens: itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,valorUnit:Number(i.valorUnit)||0,custoUnit:Number(i.custoUnit)||0})),
+        desconto: descontoAtualRS(),
         formaPagamento: formaPag,
         status: statusEl.value,
         dataEntrega: root.querySelector("#f-entrega").value,
