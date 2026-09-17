@@ -1481,10 +1481,14 @@ function renderFinanceiro(c){
   const anterior = resumoMes(deslocaMes(ym,-1));
 
   // só trava a navegação onde não existe mais nada pra ver: antes do
-  // primeiro lançamento e depois do mês atual
+  // primeiro lançamento e depois do último. Parcela de "Parcelado
+  // personalizado" cai em mês futuro (a data dela é o vencimento) — por
+  // isso não trava mais em "hoje": trava no último mês que tem
+  // lançamento, e esse último pode estar à frente do mês atual.
   const primeiroMes = meses.length ? meses[0] : ymAtual();
+  const ultimoMes = meses.length && meses[meses.length-1] > ymAtual() ? meses[meses.length-1] : ymAtual();
   const podeVoltar = ym > primeiroMes;
-  const podeAvancar = ym < ymAtual();
+  const podeAvancar = ym < ultimoMes;
 
   const difResultado = r.resultado - anterior.resultado;
   const temAnterior = anterior.lancamentos.length > 0;
