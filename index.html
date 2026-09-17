@@ -2173,7 +2173,7 @@ function openFinanceiroForm(existing){
       <div class="field"><label>Data</label><input id="f-data" type="date" value="${v.data}"></div>
       <div class="field"><label>Tipo</label><select id="f-tipo">${["Entrada","Saída"].map(o=>`<option ${v.tipo===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
-    <div class="field"><label>Categoria</label><select id="f-cat">${["Venda de produto","Compra de estoque","Parcelamento de cliente","Despesa fixa","Despesa variável","Outro"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
+    <div class="field"><label>Categoria</label><select id="f-cat">${["Venda de produto","Compra de estoque","Parcelamento de cliente","Dívida anterior","Despesa fixa","Despesa variável","Outro"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
 
     <div id="compra-box" style="display:none">
       <div class="field"><label>Itens que entraram</label><div id="compra-itens"></div><button class="btn ghost" type="button" id="add-compra" style="width:100%;margin-top:8px">+ Adicionar produto</button></div>
@@ -2185,6 +2185,11 @@ function openFinanceiroForm(existing){
       <div class="field-row"><div class="field"><label>Valor total devido</label><input id="f-parcel-total" type="number" min="0" step="0.01"></div><div class="field"><label>Valor de cada parcela</label><input id="f-parcel-valor" type="number" min="0" step="0.01"></div></div>
       <div class="field-row"><div class="field"><label>Frequência</label><select id="f-parcel-freq"><option value="7">Semanal</option><option value="15">A cada 15 dias</option></select></div><div class="field"><label>Primeiro vencimento</label><input id="f-parcel-venc" type="date" value="${todayISO()}"></div></div>
       <p class="hint" id="parcel-previa">Uma conta a receber será criada para cada parcela.</p>
+    </div>
+
+    <div id="divida-box" style="display:none">
+      <div class="field"><label>Cliente</label><select id="f-divida-cli">${clienteOptions(v.clienteId)}</select></div>
+      <p class="hint">Pra um débito que o cliente já tinha antes do app existir — não mexe no Estoque, só entra em "a receber" vinculado a ele. Data e valor abaixo ficam livres pra registrar o que já era devido.</p>
     </div>
 
     <div id="generico-box">
@@ -2216,7 +2221,7 @@ function openFinanceiroForm(existing){
   `, root=>{
     root.querySelector("#cancel").addEventListener("click", closeSheet);
     const catEl = root.querySelector("#f-cat"), tipoEl = root.querySelector("#f-tipo"),
-          box = root.querySelector("#compra-box"), parcelBox=root.querySelector("#parcel-box"), genericoBox=root.querySelector("#generico-box"), valorEl=root.querySelector("#f-valor"), compraBox=root.querySelector("#compra-itens");
+          box = root.querySelector("#compra-box"), parcelBox=root.querySelector("#parcel-box"), dividaBox=root.querySelector("#divida-box"), genericoBox=root.querySelector("#generico-box"), valorEl=root.querySelector("#f-valor"), compraBox=root.querySelector("#compra-itens");
 
     /* O bloco de entrada de estoque só faz sentido em compra de estoque —
        aparecer sempre só confundiria. */
@@ -2244,6 +2249,23 @@ function openFinanceiroForm(existing){
       if(ehParcel){ tipoEl.value="Entrada"; valorEl.readOnly=true; root.querySelector("#f-liq").value="nao"; }
       if(!ehParcel) valorEl.readOnly=catEl.value==="Compra de estoque";
     }
+    /* Dívida anterior é um lançamento único vinculado a cliente — mesma
+       vinculação do Parcelamento, sem forçar plano de parcelas. Só define
+       "ainda não recebido" pra lançamento novo — reabrir um já editado não
+       pode reverter o que já foi marcado como recebido. */
+    function toggleDivida(){
+      const ehDivida = catEl.value==="Dívida anterior";
+      dividaBox.style.display = ehDivida ? "block" : "none";
+      if(ehDivida){
+        tipoEl.value="Entrada";
+        if(!isEdit) liqEl.value="nao";
+        toggleLiquidado();
+      }
+    }
+    root.querySelector("#f-divida-cli").addEventListener("change", ()=>{
+      const descEl=root.querySelector("#f-desc"), cli=getCliente(root.querySelector("#f-divida-cli").value);
+      if(cli && !descEl.value.trim()) descEl.value=`Dívida anterior — ${cli.nome}`;
+    });
     function atualizaPreviaParcelas(){
       const total=Number(root.querySelector("#f-parcel-total").value)||0, parcela=Number(root.querySelector("#f-parcel-valor").value)||0;
       root.querySelector("#parcel-previa").textContent=total>0&&parcela>0?`${Math.ceil(total/parcela)} parcela(s): a última ajusta o restante automaticamente.`:"Informe total e valor da parcela para ver o combinado.";
@@ -2271,6 +2293,8 @@ function openFinanceiroForm(existing){
     liqEl.addEventListener("change", toggleLiquidado);
     tipoEl.addEventListener("change", toggleLiquidado);
     toggleLiquidado();
+    catEl.addEventListener("change", toggleDivida);
+    toggleDivida();
 
     const delBtn = root.querySelector("#del");
     if(delBtn) delBtn.addEventListener("click", ()=>{
@@ -2299,6 +2323,9 @@ function openFinanceiroForm(existing){
         }
         state.finMes=primeiro.slice(0,7); saveDB(); closeSheet(); toast(`${quantidade} parcela(s) lançada(s) em A receber`); render(); return;
       }
+      const ehDivida = catEl.value==="Dívida anterior";
+      const dividaCliId = ehDivida ? root.querySelector("#f-divida-cli").value : null;
+      if(ehDivida && !dividaCliId){ alert("Escolha o cliente."); return; }
       const valor = Number(root.querySelector("#f-valor").value)||0;
       if(valor<=0){ alert("Informe um valor maior que zero."); return; }
       const itensValidos=ehCompra?compraItens.filter(i=>i.produtoId&&Number(i.qtd)>0):[];
@@ -2312,6 +2339,7 @@ function openFinanceiroForm(existing){
         valor,
         formaPagamento: root.querySelector("#f-pag").value,
         pedidoId: v.pedidoId || null,
+        clienteId: ehDivida ? dividaCliId : null,
         obs: v.obs||"",
         itensEstoque: ehCompra ? itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,custoUnit:Number(i.custoUnit)||0})) : [],
         liquidado: liqEl.value==="sim",
