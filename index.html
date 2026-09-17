@@ -1369,7 +1369,7 @@ function renderEstoque(c){
     const badge = furo ? {cls:"critical", txt:"FALTA"} : baixo ? {cls:"critical", txt:"REPOR"} : {cls:"ok", txt:"OK"};
     return `<div class="card" style="cursor:default">
       <div class="card-row">
-        <div><div class="card-title">${esc(e.produto)}</div><div class="card-sub">${esc(e.categoria||"—")}</div></div>
+        <div><div class="card-title" style="font-size:20px;font-weight:700">${esc(e.produto)}</div><div class="card-sub">${esc(e.categoria||"—")}</div></div>
         <span class="badge ${badge.cls}">${badge.txt}</span>
       </div>
       <div class="card-row" style="margin-top:10px;align-items:center">
