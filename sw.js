@@ -5,7 +5,7 @@
 // Subir esse número a cada mudança no app, senão o celular que já tem o
 // Caderno instalado continua servindo a versão antiga do cache. O activate
 // abaixo apaga todo cache com nome diferente deste.
-const CACHE = "caderno-gallard-v6";
+const CACHE = "caderno-gallard-v7";
 const ASSETS = [
   "./",
   "./index.html",

@@ -258,6 +258,22 @@ p{margin:0}
 }
 .chip[aria-pressed="true"]{background:var(--gold-deep);color:var(--surface);border-color:var(--gold-deep)}
 
+.cal-semana,.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.cal-semana{margin-bottom:4px}
+.cal-semana .cab{text-align:center;font-size:11px;color:var(--ink-faint);font-weight:700}
+.cal-cel{
+  aspect-ratio:1;border:none;border-radius:10px;background:var(--surface-card);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  cursor:pointer;color:var(--ink);font-size:13px;
+}
+.cal-cel.vazio{background:none;cursor:default}
+.cal-cel.hoje{box-shadow:inset 0 0 0 1.5px var(--gold-deep)}
+.cal-cel.sel{background:var(--gold-deep);color:var(--surface)}
+.cal-cel .dot{width:5px;height:5px;border-radius:50%}
+.cal-legenda{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 4px;font-size:11.5px;color:var(--ink-soft)}
+.cal-legenda span{display:inline-flex;align-items:center;gap:5px}
+.cal-legenda .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+
 .fab{
   position:fixed;z-index:25;right:calc(50% - 280px + 20px);bottom:86px;
   width:54px;height:54px;border-radius:50%;border:none;cursor:pointer;
@@ -407,6 +423,22 @@ function migrar(dbv){
   return dbv;
 }
 
+/* As categorias e a unidade do Estoque mudaram (2026-09-17): categoria
+   passou de Hidratação/Nutrição/Reconstrução/Finalização/Outro pra
+   Tratamento/Finalizadores/Alinhamento, e unidade virou só "Unidades".
+   Sem isso, abrir e salvar um produto antigo sem mexer no campo
+   reclassificava ele sozinho, porque o <select> não tem mais a opção
+   antiga marcada. Roda em todo load — idempotente, não mexe em quem já
+   está no valor novo. */
+function normalizarEstoque(dbv){
+  const mapaCategoria = {"Hidratação":"Tratamento","Nutrição":"Tratamento","Reconstrução":"Tratamento","Finalização":"Finalizadores","Outro":"Tratamento"};
+  (dbv.estoque||[]).forEach(e=>{
+    if(mapaCategoria[e.categoria]) e.categoria = mapaCategoria[e.categoria];
+    if(e.unidade !== "Unidades") e.unidade = "Unidades";
+  });
+  return dbv;
+}
+
 function loadDB(){
   try{
     const raw = localStorage.getItem(DB_KEY);
@@ -417,7 +449,7 @@ function loadDB(){
     // o merge herdaria a versão nova e a migração seria pulada. Banco sem
     // `schema` é, por definição, o formato 1.
     merged.schema = Number(parsed.schema) || 1;
-    return migrar(merged);
+    return normalizarEstoque(migrar(merged));
   }catch(e){ return structuredClone(EMPTY_DB); }
 }
 function saveDB(){ localStorage.setItem(DB_KEY, JSON.stringify(db)); }
@@ -448,6 +480,14 @@ function daysSince(iso){
   return Math.round((b-a)/86400000);
 }
 function getCliente(id){ return db.clientes.find(c=>c.id===id); }
+/* Mesmo mecanismo do deslocaMes, mas em dias — parte sempre de uma data
+   já em ISO local (meia-noite), então somar horas nunca cruza a virada
+   de dia em UTC (o Brasil está atrás, não na frente). */
+function deslocaData(iso, dias){
+  const d = new Date(iso+"T00:00:00");
+  d.setDate(d.getDate()+dias);
+  return d.toISOString().slice(0,10);
+}
 function getProduto(id){ return db.estoque.find(e=>e.id===id); }
 function pedidoItens(p){ return Array.isArray(p.itens) ? p.itens : [{produtoId:p.produtoId,produto:p.produto,custoUnit:p.custoUnit,qtd:p.qtd,valorUnit:p.valorUnit}]; }
 function pedidoTotal(p){ return pedidoItens(p).reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0); }
@@ -515,6 +555,55 @@ function reconciliarEstoqueCompra(anterior, atual){
     atual.itensEstoque = [];
   }
 }
+/* Gera (ou regenera) as parcelas de um pedido pago em "Parcelado
+   personalizado". Nunca mexe nas parcelas já recebidas — só reajusta a
+   numeração delas ("3/5"), pra continuar batendo depois de uma correção.
+   As ainda não recebidas são sempre substituídas, recalculadas a partir
+   do saldo restante (total do pedido menos o que já entrou) — é assim
+   que "quanto o cliente ainda deve" fica sempre certo sem conta manual,
+   inclusive quando o pedido é editado depois. */
+function gerarParcelasPedido(pedido, cliente, parcelasAntigas){
+  const liquidadas = parcelasAntigas.filter(f=>f.liquidado);
+  const totalJaRecebido = liquidadas.reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const idsNaoRecebidas = parcelasAntigas.filter(f=>!f.liquidado).map(f=>f.id);
+  if(idsNaoRecebidas.length) db.financeiro = db.financeiro.filter(f=>!idsNaoRecebidas.includes(f.id));
+
+  const totalPedido = pedidoTotal(pedido);
+  const restante = Math.max(0, Math.round((totalPedido-totalJaRecebido)*100)/100);
+  const planoId = (parcelasAntigas[0] && parcelasAntigas[0].parcelamentoId) || uid();
+  const valorParcela = Number(pedido.parcelaValor)>0 ? Number(pedido.parcelaValor) : restante;
+  const intervalo = Number(pedido.parcelaIntervalo)||7;
+  const primeiro = pedido.parcelaPrimeiroVenc || todayISO();
+  const numeroInicial = liquidadas.length;
+
+  let quantidadeNovas = 0;
+  if(restante>0 && valorParcela>0){
+    quantidadeNovas = Math.max(1, Math.ceil(restante/valorParcela));
+    let sobra = restante;
+    for(let n=0;n<quantidadeNovas;n++){
+      const valor = Math.round(Math.min(valorParcela,sobra)*100)/100;
+      const d = new Date(primeiro+"T00:00:00"); d.setDate(d.getDate()+n*intervalo);
+      const venc = d.toISOString().slice(0,10);
+      db.financeiro.push({
+        id: uid(), data: venc, tipo:"Entrada", categoria:"Venda parcelada",
+        descricao: `${pedidoResumoProdutos(pedido)} — ${cliente?cliente.nome:""}`,
+        valor, pedidoId: pedido.id, clienteId: pedido.clienteId,
+        parcelamentoId: planoId, parcelaNumero: numeroInicial+n+1, totalParcelas: numeroInicial+quantidadeNovas,
+        frequencia: intervalo===7?"semanal":"a cada 15 dias",
+        formaPagamento: "Parcelado personalizado", obs: "",
+        estoqueId: null, qtdEntrada: 0, itensEstoque: [],
+        liquidado: false, liquidadoEm: null, vencimento: venc,
+      });
+      sobra -= valor;
+    }
+  }
+  liquidadas.forEach((f,i)=>{ f.parcelaNumero=i+1; f.totalParcelas=numeroInicial+quantidadeNovas; });
+
+  return quantidadeNovas>0
+    ? `Entregue — ${quantidadeNovas} parcela(s) de ${fmtMoney(valorParcela)} lançadas em A receber`
+    : "Entregue — pedido já está totalmente pago";
+}
+
 function esc(s){ return (s??"").toString().replace(/[&<>"']/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
 
 function toast(msg){
@@ -647,6 +736,51 @@ function mesesComMovimento(){
   return [...new Set(db.financeiro.map(f=>(f.data||"").slice(0,7)).filter(Boolean))].sort();
 }
 
+/* ---------- CALENDÁRIO DO FINANCEIRO ---------- */
+const DIAS_SEMANA_ABREV = ["D","S","T","Q","Q","S","S"];
+
+/* new Date(ano, mêsIndex, dia) monta em hora LOCAL, sem o problema de
+   fuso do toISOString() — seguro pra contar dias do mês e descobrir em
+   que dia da semana o mês começa. */
+function diasNoMes(ym){
+  const [a,m] = ym.split("-").map(Number);
+  return new Date(a, m, 0).getDate();
+}
+function primeiroDiaSemanaDoMes(ym){
+  const [a,m] = ym.split("-").map(Number);
+  return new Date(a, m-1, 1).getDay();
+}
+
+/* Um ponto por dia com lançamento: verde se o líquido do dia é positivo,
+   vermelho se negativo, âmbar se só tem coisa em aberto (nada líquido
+   ainda). Clicar num dia filtra a lista de lançamentos pra só ele. */
+function renderCalendarioMes(ym, lancamentos){
+  const porDia = {};
+  lancamentos.forEach(f=>{ (porDia[f.data]=porDia[f.data]||[]).push(f); });
+  const totalDias = diasNoMes(ym), offset = primeiroDiaSemanaDoMes(ym), hoje = todayISO();
+  let celulas = "";
+  for(let i=0;i<offset;i++) celulas += `<div class="cal-cel vazio"></div>`;
+  for(let d=1; d<=totalDias; d++){
+    const iso = `${ym}-${String(d).padStart(2,"0")}`;
+    const doDia = porDia[iso]||[];
+    const liquido = doDia.filter(f=>f.liquidado).reduce((s,f)=> s+(f.tipo==="Entrada"?Number(f.valor)||0:-(Number(f.valor)||0)), 0);
+    const temPendente = doDia.some(f=>!f.liquidado);
+    const cor = !doDia.length ? "" : liquido>0 ? "var(--ok)" : liquido<0 ? "var(--critical)" : (temPendente ? "var(--warn)" : "var(--ink-faint)");
+    celulas += `<button class="cal-cel${state.finDia===iso?" sel":""}${iso===hoje?" hoje":""}" data-dia="${iso}">
+      <span>${d}</span>${doDia.length?`<span class="dot" style="background:${cor}"></span>`:""}
+    </button>`;
+  }
+  return `
+    <div class="cal-semana">${DIAS_SEMANA_ABREV.map(d=>`<div class="cab">${d}</div>`).join("")}</div>
+    <div class="cal-grid">${celulas}</div>
+    <div class="cal-legenda">
+      <span><span class="dot" style="background:var(--ok)"></span>entrou mais do que saiu</span>
+      <span><span class="dot" style="background:var(--critical)"></span>saiu mais do que entrou</span>
+      <span><span class="dot" style="background:var(--warn)"></span>só em aberto</span>
+    </div>
+  `;
+}
+
 /* ---------- roteamento simples ---------- */
 let state = { view: "inicio", modal:null };
 
@@ -678,7 +812,7 @@ function setView(view, opts={}){
 
 function renderTabbar(){
   const bar = document.getElementById("tabbar");
-  const activeGroup = ["estoque","financeiro","backup"].includes(state.view) ? "mais" : state.view;
+  const activeGroup = ["estoque","financeiro","backup","dashboard"].includes(state.view) ? "mais" : state.view;
   bar.innerHTML = TABS.map(t=>`
     <button class="tabbtn" aria-current="${activeGroup===t.id}" data-tab="${t.id}">
       ${ICONS[t.id]}<span>${t.label}</span>
@@ -706,6 +840,7 @@ function render(){
     pedidos: renderPedidos,
     followup: renderFollowup,
     mais: renderMais,
+    dashboard: renderDashboard,
     estoque: renderEstoque,
     financeiro: renderFinanceiro,
     backup: renderBackup,
@@ -718,6 +853,7 @@ function render(){
     pedidos:["Pedidos", db.pedidos.length + " no total"],
     followup:["Follow-up", "Quem precisa de contato"],
     mais:["Mais", "Estoque, financeiro e backup"],
+    dashboard:["Dashboard", "Ranking e comparativo"],
     estoque:["Estoque", db.estoque.length + " produto(s)"],
     financeiro:["Financeiro", "Entradas e saídas"],
     backup:["Backup", "Seus dados, seu controle"],
@@ -868,6 +1004,16 @@ function renderClienteDetalhe(c){
   const followsCliente = db.followups.filter(f=>f.clienteId===cl.id).sort((a,b)=>(b.proximoContato||"").localeCompare(a.proximoContato||""));
   const totalComprado = pedidosCliente.reduce((s,p)=> s + pedidoTotal(p), 0);
 
+  /* Saldo do cliente — soma tudo que é dele no Financeiro (venda avulsa,
+     parcela de pedido, parcelamento solto), separando o que já entrou do
+     que ainda falta. É a resposta pra "quanto ele me deve e quanto ele já
+     pagou", sem precisar somar pedido por pedido na cabeça. */
+  const finCliente = db.financeiro.filter(f=>f.clienteId===cl.id && f.tipo==="Entrada");
+  const totalPago = finCliente.filter(f=>f.liquidado).reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const emAbertoCliente = finCliente.filter(f=>!f.liquidado).sort((a,b)=>(a.vencimento||"").localeCompare(b.vencimento||""));
+  const totalDevido = emAbertoCliente.reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const hoje = todayISO();
+
   c.innerHTML = `
     <div class="card" style="cursor:default">
       <div class="card-row">
@@ -893,6 +1039,26 @@ function renderClienteDetalhe(c){
       <div class="kpi"><div class="v tnum">${fmtMoney(totalComprado)}</div><div class="l">Total comprado</div></div>
     </div>
 
+    <div class="section-label">Saldo</div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v tnum" style="color:var(--ok)">${fmtMoney(totalPago)}</div><div class="l">Já pago</div></div>
+      <div class="kpi"><div class="v tnum" style="color:${totalDevido>0?"var(--critical)":"inherit"}">${fmtMoney(totalDevido)}</div><div class="l">Ainda deve</div></div>
+    </div>
+    ${emAbertoCliente.length ? emAbertoCliente.map(f=>{
+      const atrasado = f.vencimento && f.vencimento<hoje;
+      const quando = !f.vencimento ? "sem data combinada" : atrasado ? `atrasado desde ${fmtDate(f.vencimento)}` : f.vencimento===hoje ? "vence hoje" : `vence ${fmtDate(f.vencimento)}`;
+      return `<div class="card" style="cursor:default">
+        <div class="card-row">
+          <div><div class="card-sub">${esc(f.parcelamentoId?`${f.frequencia||""} · parcela ${f.parcelaNumero}/${f.totalParcelas}`:(f.descricao||f.categoria))}</div></div>
+          <div class="card-value tnum" style="color:var(--critical)">${fmtMoney(f.valor)}</div>
+        </div>
+        <div class="card-row" style="margin-top:8px;align-items:center;gap:10px">
+          <span class="badge ${atrasado?"critical":f.vencimento===hoje?"warn":"neutral"}">${quando}</span>
+          <button class="btn primary" style="flex:none;padding:8px 14px;font-size:13px" data-liquidar="${f.id}">Recebi</button>
+        </div>
+      </div>`;
+    }).join("") : ""}
+
     <div class="section-label">Pedidos</div>
     ${pedidosCliente.length? pedidosCliente.map(pedidoCard).join("") : `<div class="empty" style="padding:20px 8px"><div class="small">Nenhum pedido ainda.</div></div>`}
 
@@ -911,6 +1077,7 @@ function renderClienteDetalhe(c){
   });
   c.querySelectorAll("[data-pedido]").forEach(b=> b.addEventListener("click", ()=> openPedidoForm(db.pedidos.find(p=>p.id===b.dataset.pedido))));
   c.querySelectorAll("[data-follow]").forEach(b=> b.addEventListener("click", ()=> openFollowForm(db.followups.find(f=>f.id===b.dataset.follow))));
+  c.querySelectorAll("[data-liquidar]").forEach(b=> b.addEventListener("click", ()=> liquidar(b.dataset.liquidar)));
 }
 
 function pedidoCard(p){
@@ -920,10 +1087,23 @@ function pedidoCard(p){
   const custo = pedidoCusto(p);
   const map = {"Pendente":"warn","Entregue":"ok","Cancelado":"critical"};
   const semVinculo = itens.some(i=>!i.produtoId || !getProduto(i.produtoId));
-  // entregue mas ainda não pago — o lançamento ligado a ele não liquidou
-  const fin = db.financeiro.find(f=>f.pedidoId===p.id);
-  const aReceber = p.status==="Entregue" && fin && !fin.liquidado;
-  const atrasado = aReceber && p.vencimento && p.vencimento < todayISO();
+  const parcelado = p.formaPagamento==="Parcelado personalizado";
+  // entregue mas ainda não pago — o(s) lançamento(s) ligado(s) a ele não liquidaram.
+  // Parcelado gera vários lançamentos (um por parcela); os demais, só um.
+  const finsPedido = db.financeiro.filter(f=>f.pedidoId===p.id);
+  const fin = finsPedido[0];
+  let aReceber, atrasado, resumoParcelas="";
+  if(parcelado){
+    const abertas = finsPedido.filter(f=>!f.liquidado);
+    aReceber = p.status==="Entregue" && abertas.length>0;
+    const proxima = abertas.slice().sort((a,b)=>(a.vencimento||"").localeCompare(b.vencimento||""))[0];
+    atrasado = !!(proxima && proxima.vencimento && proxima.vencimento<todayISO());
+    const totalAberto = abertas.reduce((s,f)=>s+(Number(f.valor)||0),0);
+    resumoParcelas = aReceber ? `${finsPedido.length-abertas.length}/${finsPedido.length} parcelas recebidas — ${fmtMoney(totalAberto)} em aberto${proxima?`, próxima ${fmtDate(proxima.vencimento)}`:""}` : "";
+  }else{
+    aReceber = p.status==="Entregue" && fin && !fin.liquidado;
+    atrasado = aReceber && p.vencimento && p.vencimento < todayISO();
+  }
   return `<button class="card" data-pedido="${p.id}">
     <div class="card-row">
       <div>
@@ -933,7 +1113,8 @@ function pedidoCard(p){
       <div class="card-right"><div class="card-value tnum">${fmtMoney(total)}</div><span class="badge ${map[p.status]||"neutral"}">${esc(p.status||"—")}</span></div>
     </div>
     ${semVinculo?`<div class="card-meta" style="margin-top:6px"><span style="color:var(--critical)">Há item sem vínculo com o estoque — abra e escolha o produto</span></div>`:""}
-    ${aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${atrasado?`a receber — atrasado desde ${fmtDate(p.vencimento)}`:(p.vencimento?`a receber até ${fmtDate(p.vencimento)}`:"a receber — sem data combinada")}</span></div>`:""}
+    ${parcelado && aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${esc(resumoParcelas)}${atrasado?" — atrasada":""}</span></div>`:""}
+    ${!parcelado && aReceber?`<div class="card-meta" style="margin-top:6px"><span style="color:${atrasado?"var(--critical)":"var(--warn)"}">${atrasado?`a receber — atrasado desde ${fmtDate(p.vencimento)}`:(p.vencimento?`a receber até ${fmtDate(p.vencimento)}`:"a receber — sem data combinada")}</span></div>`:""}
     <div class="card-meta">
       <span>${fmtDate(p.data)}</span>
       ${custo>0 && p.status!=="Cancelado" ? `<span>lucro ${fmtMoney(total-custo)}</span>` : `<span>${esc(p.formaPagamento||"—")}</span>`}
@@ -983,6 +1164,39 @@ function renderPedidos(c){
 }
 
 /* ---------- FOLLOW-UP ---------- */
+/* Avisos automáticos do Follow-up — não dependem de ninguém criar um
+   follow-up manual, saem sozinhos do Financeiro: quem está devendo
+   (a receber atrasado), quem tá pagando em dia (a receber vencendo nos
+   próximos 3 dias) e conta fixa perto de vencer (Despesa fixa não paga,
+   nos próximos 5 dias). */
+function avisosAutomaticos(){
+  const hoje = todayISO();
+  const emAberto = db.financeiro.filter(f=>!f.liquidado && f.vencimento);
+  const devedores = emAberto.filter(f=>f.tipo==="Entrada" && f.vencimento<hoje).sort((a,b)=>a.vencimento.localeCompare(b.vencimento));
+  const aVencer = emAberto.filter(f=>f.tipo==="Entrada" && f.vencimento>=hoje && f.vencimento<=deslocaData(hoje,3)).sort((a,b)=>a.vencimento.localeCompare(b.vencimento));
+  const contasFixas = emAberto.filter(f=>f.tipo==="Saída" && f.categoria==="Despesa fixa" && f.vencimento<=deslocaData(hoje,5)).sort((a,b)=>a.vencimento.localeCompare(b.vencimento));
+
+  if(!devedores.length && !aVencer.length && !contasFixas.length) return "";
+
+  const linha = (f, cor)=>{
+    const cli = getCliente(f.clienteId) || (f.pedidoId ? getCliente((db.pedidos.find(p=>p.id===f.pedidoId)||{}).clienteId) : null);
+    const atrasado = f.vencimento<hoje;
+    const dias = daysSince(f.vencimento);
+    const quando = atrasado ? `atrasado ${dias} dia${dias>1?"s":""}` : f.vencimento===hoje ? "vence hoje" : `vence ${fmtDate(f.vencimento)}`;
+    return `<button class="alert-card" data-cliente-aviso="${cli?cli.id:""}">
+      <span class="alert-dot" style="background:${cor}"></span>
+      <div><div class="t1">${esc(cli?cli.nome:(f.descricao||f.categoria))}</div><div class="t2">${fmtMoney(f.valor)} · ${quando}</div></div>
+      ${ICONS.chev}
+    </button>`;
+  };
+
+  return `
+    ${devedores.length?`<div class="section-label">Devendo — atrasado</div>${devedores.map(f=>linha(f,"var(--critical)")).join("")}`:""}
+    ${aVencer.length?`<div class="section-label">Pagando em dia — vence nos próximos dias</div>${aVencer.map(f=>linha(f,"var(--ok)")).join("")}`:""}
+    ${contasFixas.length?`<div class="section-label">Conta fixa perto de vencer</div>${contasFixas.map(f=>linha(f,"var(--warn)")).join("")}`:""}
+  `;
+}
+
 function renderFollowup(c){
   const list = db.followups.slice().sort((a,b)=>{
     const da = daysSince(a.ultimaInteracao) ?? -1, db_ = daysSince(b.ultimaInteracao) ?? -1;
@@ -990,11 +1204,13 @@ function renderFollowup(c){
     if(pa!==pb) return pa? -1:1;
     return db_-da;
   });
+  const avisos = avisosAutomaticos();
   if(list.length===0){
-    c.innerHTML = `<div class="empty"><div class="big">Nenhum follow-up</div><div class="small">Toque no + pra lembrar de retomar contato com alguém.</div></div>`;
+    c.innerHTML = avisos + `<div class="empty"><div class="big">Nenhum follow-up</div><div class="small">Toque no + pra lembrar de retomar contato com alguém.</div></div>`;
+    c.querySelectorAll("[data-cliente-aviso]").forEach(b=>{ if(b.dataset.clienteAviso) b.addEventListener("click", ()=> setView("cliente-detalhe",{arg:b.dataset.clienteAviso})); });
     return;
   }
-  c.innerHTML = list.map(f=>{
+  c.innerHTML = avisos + (avisos?`<div class="section-label">Follow-up</div>`:"") + list.map(f=>{
     const cl = getCliente(f.clienteId);
     const d = daysSince(f.ultimaInteracao);
     const atrasado = f.status==="Pendente" && d!==null && d>7;
@@ -1020,12 +1236,17 @@ function renderFollowup(c){
     saveDB(); toast("Follow-up marcado como feito"); renderFollowup(c);
   }));
   c.querySelectorAll("[data-edit]").forEach(b=> b.addEventListener("click", ()=> openFollowForm(db.followups.find(x=>x.id===b.dataset.edit))));
+  c.querySelectorAll("[data-cliente-aviso]").forEach(b=>{ if(b.dataset.clienteAviso) b.addEventListener("click", ()=> setView("cliente-detalhe",{arg:b.dataset.clienteAviso})); });
 }
 
 /* ---------- MAIS ---------- */
 function renderMais(c){
   const k = computeKPIs();
   c.innerHTML = `
+    <button class="menu-item" data-goto="dashboard">
+      <div><div class="mi-title">Dashboard</div><div class="mi-sub">Ranking de clientes, produtos e meses</div></div>
+      <span class="chev">${ICONS.chev}</span>
+    </button>
     <button class="menu-item" data-goto="estoque">
       <div><div class="mi-title">Estoque</div><div class="mi-sub">${db.estoque.length} produto(s)${k.estoqueBaixo.length?` · ${k.estoqueBaixo.length} pra repor`:""}</div></div>
       <span class="chev">${ICONS.chev}</span>
@@ -1044,6 +1265,75 @@ function renderMais(c){
     </p>
   `;
   c.querySelectorAll("[data-goto]").forEach(b=> b.addEventListener("click", ()=> setView(b.dataset.goto)));
+}
+
+/* ---------- DASHBOARD ---------- */
+/* Três rankings + comparativo de meses, todos calculados na hora a
+   partir de pedidos e financeiro — nada disso fica salvo à parte, então
+   nunca desatualiza. */
+function computeDashboard(){
+  const porCliente = {};
+  db.pedidos.filter(p=>p.status!=="Cancelado").forEach(p=>{ porCliente[p.clienteId] = (porCliente[p.clienteId]||0) + pedidoTotal(p); });
+  const rankingClientes = Object.entries(porCliente)
+    .map(([id,total])=>({cliente:getCliente(id), total}))
+    .filter(r=>r.cliente).sort((a,b)=>b.total-a.total).slice(0,5);
+
+  const devedorPorCliente = {};
+  db.financeiro.filter(f=>f.tipo==="Entrada" && !f.liquidado && f.clienteId).forEach(f=>{ devedorPorCliente[f.clienteId] = (devedorPorCliente[f.clienteId]||0)+(Number(f.valor)||0); });
+  const rankingDevedores = Object.entries(devedorPorCliente)
+    .map(([id,total])=>({cliente:getCliente(id), total}))
+    .filter(r=>r.cliente && r.total>0).sort((a,b)=>b.total-a.total).slice(0,5);
+
+  const porProduto = {};
+  db.pedidos.filter(p=>p.status!=="Cancelado").forEach(p=>{
+    pedidoItens(p).forEach(i=>{
+      if(!i.produtoId) return;
+      porProduto[i.produtoId] = porProduto[i.produtoId] || {qtd:0, valor:0};
+      porProduto[i.produtoId].qtd += Number(i.qtd)||0;
+      porProduto[i.produtoId].valor += (Number(i.qtd)||0)*(Number(i.valorUnit)||0);
+    });
+  });
+  const rankingProdutos = Object.entries(porProduto)
+    .map(([id,v])=>({produto:getProduto(id), ...v}))
+    .filter(r=>r.produto).sort((a,b)=>b.qtd-a.qtd).slice(0,5);
+
+  const ymHoje = ymAtual();
+  const comparativo = [5,4,3,2,1,0].map(i=>{ const ym=deslocaMes(ymHoje,-i); return {ym, ...resumoMes(ym)}; });
+
+  return {rankingClientes, rankingDevedores, rankingProdutos, comparativo};
+}
+
+function renderDashboard(c){
+  const d = computeDashboard();
+  const semDados = !d.rankingClientes.length && !d.rankingProdutos.length && !d.comparativo.some(m=>m.lancamentos.length);
+  if(semDados){
+    c.innerHTML = `<div class="empty"><div class="big">Ainda sem dados suficientes</div><div class="small">O dashboard se preenche sozinho conforme pedidos e lançamentos forem entrando.</div></div>`;
+    return;
+  }
+  const maxComprado = Math.max(1, ...d.rankingClientes.map(r=>r.total));
+  const maxDevido = Math.max(1, ...d.rankingDevedores.map(r=>r.total));
+  const maxProdutoValor = Math.max(1, ...d.rankingProdutos.map(r=>r.valor));
+  const maxFaturamento = Math.max(1, ...d.comparativo.map(m=>m.entradas));
+
+  c.innerHTML = `
+    ${d.rankingClientes.length?`
+      <div class="section-label">Clientes que mais compram</div>
+      ${d.rankingClientes.map(r=>catRow(r.cliente.nome, r.total, maxComprado, "var(--ok)")).join("")}
+    `:""}
+
+    ${d.rankingDevedores.length?`
+      <div class="section-label">Clientes que mais devem</div>
+      ${d.rankingDevedores.map(r=>catRow(r.cliente.nome, r.total, maxDevido, "var(--critical)")).join("")}
+    `:""}
+
+    ${d.rankingProdutos.length?`
+      <div class="section-label">Produtos mais vendidos</div>
+      ${d.rankingProdutos.map(r=>catRow(`${r.produto.produto} · ${r.qtd} ${r.produto.unidade||"un"}`, r.valor, maxProdutoValor, "var(--gold-deep)")).join("")}
+    `:""}
+
+    <div class="section-label">Faturamento — últimos 6 meses</div>
+    ${d.comparativo.map(m=>catRow(nomeMes(m.ym,true).split(" de ")[0], m.entradas, maxFaturamento, "var(--ok)")).join("")}
+  `;
 }
 
 /* ---------- ESTOQUE ---------- */
@@ -1240,25 +1530,38 @@ function renderFinanceiro(c){
       ${r.saidasPorCategoria.map(([cat,val])=> catRow(cat, val, r.saidas, "var(--critical)")).join("")}
     ` : ""}
 
-    <div class="section-label">Lançamentos</div>
+    <div class="section-label" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Lançamentos</span>
+      <div class="chiprow" style="margin:0">
+        <button class="chip" aria-pressed="${state.finView!=="calendario"}" data-view="lista">Lista</button>
+        <button class="chip" aria-pressed="${state.finView==="calendario"}" data-view="calendario">Calendário</button>
+      </div>
+    </div>
+    ${state.finView==="calendario" ? renderCalendarioMes(ym, r.lancamentos) : ""}
+    ${state.finView==="calendario" && state.finDia ? `<button class="btn ghost" id="limpar-dia" style="width:100%;margin:10px 0">Ver o mês inteiro</button>` : ""}
     <div id="fin-list"></div>
   `;
 
-  c.querySelector("#mes-ant").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym,-1); renderFinanceiro(document.getElementById("content")); });
-  c.querySelector("#mes-prox").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym, 1); renderFinanceiro(document.getElementById("content")); });
+  c.querySelector("#mes-ant").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym,-1); state.finDia=null; renderFinanceiro(document.getElementById("content")); });
+  c.querySelector("#mes-prox").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym, 1); state.finDia=null; renderFinanceiro(document.getElementById("content")); });
   c.querySelectorAll("[data-liquidar]").forEach(b=> b.addEventListener("click", ()=> liquidar(b.dataset.liquidar)));
+  c.querySelectorAll("[data-view]").forEach(b=> b.addEventListener("click", ()=>{ state.finView=b.dataset.view; if(state.finView!=="calendario") state.finDia=null; renderFinanceiro(document.getElementById("content")); }));
+  c.querySelectorAll("[data-dia]").forEach(b=> b.addEventListener("click", ()=>{ state.finDia = state.finDia===b.dataset.dia ? null : b.dataset.dia; renderFinanceiro(document.getElementById("content")); }));
+  const limparDia = c.querySelector("#limpar-dia");
+  if(limparDia) limparDia.addEventListener("click", ()=>{ state.finDia=null; renderFinanceiro(document.getElementById("content")); });
 
+  const lancamentosFiltrados = state.finDia ? r.lancamentos.filter(f=>f.data===state.finDia) : r.lancamentos;
   const box = c.querySelector("#fin-list");
-  if(r.lancamentos.length===0){
+  if(lancamentosFiltrados.length===0){
     box.innerHTML = `<div class="empty" style="padding:26px 12px">
-      <div class="small">Nenhum lançamento em ${nomeMes(ym)}.${podeVoltar?" Use a seta pra ver um mês anterior.":" Toque no + pra lançar o primeiro."}</div>
+      <div class="small">${state.finDia ? `Nenhum lançamento em ${fmtDate(state.finDia)}.` : `Nenhum lançamento em ${nomeMes(ym)}.${podeVoltar?" Use a seta pra ver um mês anterior.":" Toque no + pra lançar o primeiro."}`}</div>
     </div>`;
     return;
   }
 
   // agrupa por dia, mais recente primeiro — dentro do dia, entrada antes de saída
   const porDia = {};
-  r.lancamentos.forEach(f=>{ (porDia[f.data] = porDia[f.data] || []).push(f); });
+  lancamentosFiltrados.forEach(f=>{ (porDia[f.data] = porDia[f.data] || []).push(f); });
 
   box.innerHTML = Object.keys(porDia).sort().reverse().map(dia=>{
     const doDia = porDia[dia].slice().sort((a,b)=> (a.tipo==="Entrada"?0:1) - (b.tipo==="Entrada"?0:1));
@@ -1361,6 +1664,19 @@ function importBackup(ev){
 /* ============================================================
    FORMULÁRIOS (bottom sheet)
    ============================================================ */
+/* Botão físico/gesto de voltar do Android, num PWA instalado, fecha o
+   app se não houver histórico próprio — cada cadastro aberto empurra
+   uma entrada, e o "voltar" do sistema consome ela primeiro, fechando
+   só a ficha em vez de sair do app. `sheetHistoryPushed` evita o loop
+   entre closeSheet() chamando history.back() e o popstate chamando
+   closeSheet() de volta. */
+let sheetHistoryPushed = false;
+window.addEventListener("popstate", ()=>{
+  if(document.getElementById("modal-root").innerHTML !== ""){
+    closeSheet(true);
+  }
+});
+
 function openSheet(title, bodyHTML, onMount){
   const root = document.getElementById("modal-root");
   root.innerHTML = `
@@ -1373,9 +1689,17 @@ function openSheet(title, bodyHTML, onMount){
     </div>
   `;
   document.getElementById("ov").addEventListener("click", e=>{ if(e.target.id==="ov") closeSheet(); });
+  history.pushState({sheet:true}, "");
+  sheetHistoryPushed = true;
   onMount && onMount(root);
 }
-function closeSheet(){ document.getElementById("modal-root").innerHTML = ""; }
+function closeSheet(fromPopstate){
+  document.getElementById("modal-root").innerHTML = "";
+  if(sheetHistoryPushed){
+    sheetHistoryPushed = false;
+    if(!fromPopstate) history.back();
+  }
+}
 
 function clienteOptions(selectedId){
   return db.clientes.slice().sort((a,b)=>a.nome.localeCompare(b.nome))
@@ -1465,7 +1789,7 @@ function openPedidoForm(existing){
     <div class="field"><label>Itens do pedido</label><div id="pedido-itens"></div><button class="btn ghost" type="button" id="add-item" style="width:100%;margin-top:8px">+ Adicionar produto</button></div>
     <div class="field"><label>Valor total</label><div class="computed tnum" id="f-total"></div></div>
     <div class="field-row">
-      <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
+      <div class="field"><label>Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto","Parcelado personalizado"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
       <div class="field"><label>Data de entrega</label><input id="f-entrega" type="date" value="${v.dataEntrega||""}"></div>
     </div>
 
@@ -1482,6 +1806,16 @@ function openPedidoForm(existing){
       </div>
     </div>
 
+    <div id="parcel-ped-box" style="display:none">
+      <div class="field-row">
+        <div class="field"><label>Valor de cada parcela</label><input id="f-pp-valor" type="number" min="0" step="0.01" value="${v.parcelaValor??""}"></div>
+        <div class="field"><label>Frequência</label><select id="f-pp-freq"><option value="7" ${v.parcelaIntervalo!==15?"selected":""}>Semanal</option><option value="15" ${v.parcelaIntervalo===15?"selected":""}>A cada 15 dias</option></select></div>
+      </div>
+      <div class="field"><label>Primeiro vencimento</label><input id="f-pp-venc" type="date" value="${v.parcelaPrimeiroVenc||""}"></div>
+      <p class="hint" id="parcel-ped-previa">Informe o valor da parcela pra ver quantas parcelas isso vira.</p>
+      <p class="hint">A dívida deste pedido entra no saldo do cliente. Marcar uma parcela como recebida não mexe nas outras — é assim que dá pra saber quanto ele ainda deve.</p>
+    </div>
+
     <div class="field"><label>Observações</label><textarea id="f-obs">${esc(v.obs||"")}</textarea></div>
     <p class="hint">Pedido <b>Pendente</b> reserva a quantidade, mas não tira do estoque. Quando vira <b>Entregue</b>, sai do estoque na hora — e o dinheiro só entra no caixa quando você marcar como recebido.</p>
     <div class="btnrow">
@@ -1491,6 +1825,26 @@ function openPedidoForm(existing){
     ${isEdit?`<button class="btn danger" style="width:100%;margin-top:10px" id="del">Excluir pedido</button>`:""}
   `, root=>{
     const totEl=root.querySelector("#f-total"), statusEl=root.querySelector("#f-status"), itensBox=root.querySelector("#pedido-itens");
+
+    /* Declarado antes de renderItens/atualizaTotal de propósito: os dois
+       chamam atualizaPreviaParcelaPedido(), que lê estes campos — se essa
+       const viesse depois, a primeira chamada de atualizaTotal() quebraria
+       (TDZ, "Cannot access before initialization"). */
+    const recBox = root.querySelector("#rec-box"), recEl = root.querySelector("#f-recebi"),
+          vencBox = root.querySelector("#venc-box"), vencEl = root.querySelector("#f-venc"),
+          pagEl = root.querySelector("#f-pag"),
+          parcelPedBox = root.querySelector("#parcel-ped-box"),
+          ppValorEl = root.querySelector("#f-pp-valor"), ppVencEl = root.querySelector("#f-pp-venc"),
+          ppPrevia = root.querySelector("#parcel-ped-previa");
+    function ehParcelado(){ return pagEl.value==="Parcelado personalizado"; }
+    function atualizaPreviaParcelaPedido(){
+      const total = itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0);
+      const valorParcela = Number(ppValorEl.value)||0;
+      ppPrevia.textContent = (total>0 && valorParcela>0)
+        ? `${Math.ceil(total/valorParcela)} parcela(s) de ${fmtMoney(valorParcela)} pra fechar ${fmtMoney(total)} — a última ajusta o restante.`
+        : "Informe o valor da parcela pra ver quantas parcelas isso vira.";
+    }
+
     function renderItens(){
       itensBox.innerHTML=itens.map((i,n)=>{
         const e=getProduto(i.produtoId), disp=e?disponivel(e.id,isEdit?v.id:null):0;
@@ -1503,19 +1857,20 @@ function openPedidoForm(existing){
       itensBox.querySelectorAll("[data-valor]").forEach(el=>el.addEventListener("input",()=>{ itens[el.dataset.valor].valorUnit=Number(el.value)||0; atualizaTotal(); }));
       itensBox.querySelectorAll("[data-rem]").forEach(el=>el.addEventListener("click",()=>{ itens.splice(Number(el.dataset.rem),1); renderItens(); atualizaTotal(); }));
     }
-    function atualizaTotal(){ totEl.textContent=fmtMoney(itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0)); }
+    function atualizaTotal(){ totEl.textContent=fmtMoney(itens.reduce((s,i)=>s+(Number(i.qtd)||0)*(Number(i.valorUnit)||0),0)); if(typeof atualizaPreviaParcelaPedido==="function") atualizaPreviaParcelaPedido(); }
     root.querySelector("#add-item").addEventListener("click",()=>{ const e=db.estoque[0]; itens.push({produtoId:e.id,produto:e.produto,qtd:1,valorUnit:Number(e.precoVenda)||0,custoUnit:Number(e.custoUnit)||0}); renderItens(); atualizaTotal(); });
     renderItens(); atualizaTotal();
 
     /* O bloco de recebimento só aparece quando o pedido está Entregue —
        antes disso não há o que receber. E o campo de data só quando ela
-       escolhe "a receber". */
-    const recBox = root.querySelector("#rec-box"), recEl = root.querySelector("#f-recebi"),
-          vencBox = root.querySelector("#venc-box"), vencEl = root.querySelector("#f-venc");
+       escolhe "a receber". Parcelado personalizado usa um bloco próprio
+       no lugar deste, porque não é um único vencimento. */
     function toggleRecebimento(){
-      recBox.style.display = statusEl.value==="Entregue" ? "block" : "none";
+      const entregue = statusEl.value==="Entregue";
+      recBox.style.display = (entregue && !ehParcelado()) ? "block" : "none";
+      parcelPedBox.style.display = (entregue && ehParcelado()) ? "block" : "none";
       const aPrazo = recEl.value==="nao";
-      vencBox.style.display = (statusEl.value==="Entregue" && aPrazo) ? "block" : "none";
+      vencBox.style.display = (entregue && !ehParcelado() && aPrazo) ? "block" : "none";
       // sugere uma data em vez de deixar em branco: o caso comum é
       // combinar pra alguns dias depois da entrega
       if(aPrazo && !vencEl.value){
@@ -1524,8 +1879,17 @@ function openPedidoForm(existing){
         d.setDate(d.getDate()+7);
         vencEl.value = d.toISOString().slice(0,10);
       }
+      if(entregue && ehParcelado() && !ppVencEl.value){
+        const base = root.querySelector("#f-entrega").value || root.querySelector("#f-data").value || todayISO();
+        const d = new Date(base+"T00:00:00");
+        d.setDate(d.getDate()+(Number(root.querySelector("#f-pp-freq").value)||7));
+        ppVencEl.value = d.toISOString().slice(0,10);
+      }
+      atualizaPreviaParcelaPedido();
     }
     recEl.addEventListener("change", toggleRecebimento);
+    pagEl.addEventListener("change", toggleRecebimento);
+    ppValorEl.addEventListener("input", atualizaPreviaParcelaPedido);
     toggleRecebimento();
 
     statusEl.addEventListener("change", toggleRecebimento);
@@ -1542,18 +1906,24 @@ function openPedidoForm(existing){
     root.querySelector("#save").addEventListener("click", ()=>{
       const itensValidos=itens.filter(i=>i.produtoId && Number(i.qtd)>0);
       if(!itensValidos.length || itensValidos.length!==itens.length || itensValidos.some(i=>!getProduto(i.produtoId))){ alert("Escolha um produto do estoque e uma quantidade para cada item."); return; }
+      const formaPag = root.querySelector("#f-pag").value;
+      const parcelado = formaPag==="Parcelado personalizado";
+      if(statusEl.value==="Entregue" && parcelado && !(Number(ppValorEl.value)>0)){ alert("Informe o valor da parcela."); return; }
       const rec = {
         id: existing?existing.id:uid(),
         clienteId: root.querySelector("#f-cliente").value,
         data: root.querySelector("#f-data").value || todayISO(),
         itens: itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,valorUnit:Number(i.valorUnit)||0,custoUnit:Number(i.custoUnit)||0})),
-        formaPagamento: root.querySelector("#f-pag").value,
+        formaPagamento: formaPag,
         status: statusEl.value,
         dataEntrega: root.querySelector("#f-entrega").value,
         obs: root.querySelector("#f-obs").value.trim(),
         estoqueBaixado: false, qtdBaixada: 0,
-        aPrazo: statusEl.value==="Entregue" && recEl.value==="nao",
-        vencimento: (statusEl.value==="Entregue" && recEl.value==="nao") ? (vencEl.value || null) : null,
+        aPrazo: statusEl.value==="Entregue" && !parcelado && recEl.value==="nao",
+        vencimento: (statusEl.value==="Entregue" && !parcelado && recEl.value==="nao") ? (vencEl.value || null) : null,
+        parcelaValor: parcelado ? (Number(ppValorEl.value)||0) : null,
+        parcelaIntervalo: parcelado ? (Number(root.querySelector("#f-pp-freq").value)||7) : null,
+        parcelaPrimeiroVenc: parcelado ? (ppVencEl.value || todayISO()) : null,
       };
 
       // devolve a baixa antiga e aplica a nova — cobre troca de produto,
@@ -1564,29 +1934,45 @@ function openPedidoForm(existing){
       else{ db.pedidos.push(rec); }
 
       // lançamento financeiro segue o status: só existe se estiver Entregue.
-      // Preserva se já foi marcado como recebido, pra editar o pedido não
-      // "desreceber" um dinheiro que já entrou.
-      const anteriorFin = db.financeiro.find(f=>f.pedidoId===rec.id);
-      // !! obrigatório: sem ele isso vira undefined, e JSON.stringify
-      // descarta chave undefined — o campo sumiria do que fica salvo
-      const jaRecebido = !!(anteriorFin && anteriorFin.liquidado && rec.aPrazo);
-      db.financeiro = db.financeiro.filter(f=>f.pedidoId!==rec.id);
-      if(rec.status==="Entregue"){
-        const cli = getCliente(rec.clienteId);
-        const liquidado = !rec.aPrazo || jaRecebido;
-        db.financeiro.push({
-          id: anteriorFin ? anteriorFin.id : uid(),
-          data: rec.dataEntrega||rec.data, tipo:"Entrada", categoria:"Venda de produto",
-          descricao: `${pedidoResumoProdutos(rec)} — ${cli?cli.nome:""}`, valor: pedidoTotal(rec),
-          pedidoId: rec.id, formaPagamento: rec.formaPagamento, obs:"",
-          estoqueId: null, qtdEntrada: 0,
-          liquidado,
-          liquidadoEm: liquidado ? (jaRecebido ? anteriorFin.liquidadoEm : (rec.dataEntrega||rec.data)) : null,
-          vencimento: rec.aPrazo ? rec.vencimento : null,
-        });
+      // Parcelas já recebidas nunca são apagadas — é o que permite corrigir
+      // um pedido parcelado sem perder o que o cliente já pagou.
+      const cli = getCliente(rec.clienteId);
+      const entriesAntigas = db.financeiro.filter(f=>f.pedidoId===rec.id);
+      const entradaUnicaAntiga = entriesAntigas.find(f=>!f.parcelamentoId);
+      const parcelasAntigas = entriesAntigas.filter(f=>f.parcelamentoId);
+      let jaRecebido = false, mensagemParcelas = null;
+
+      if(rec.status==="Entregue" && parcelado){
+        if(entradaUnicaAntiga) db.financeiro = db.financeiro.filter(f=>f.id!==entradaUnicaAntiga.id);
+        mensagemParcelas = gerarParcelasPedido(rec, cli, parcelasAntigas);
+      }else{
+        // saiu do parcelado (ou nunca esteve nele): as parcelas ainda não
+        // recebidas não fazem mais sentido pro novo plano — remove só essas,
+        // as recebidas ficam como histórico
+        const idsNaoRecebidas = parcelasAntigas.filter(f=>!f.liquidado).map(f=>f.id);
+        if(idsNaoRecebidas.length) db.financeiro = db.financeiro.filter(f=>!idsNaoRecebidas.includes(f.id));
+
+        // !! obrigatório: sem ele isso vira undefined, e JSON.stringify
+        // descarta chave undefined — o campo sumiria do que fica salvo
+        jaRecebido = !!(entradaUnicaAntiga && entradaUnicaAntiga.liquidado && rec.aPrazo);
+        if(entradaUnicaAntiga) db.financeiro = db.financeiro.filter(f=>f.id!==entradaUnicaAntiga.id);
+        if(rec.status==="Entregue"){
+          const liquidado = !rec.aPrazo || jaRecebido;
+          db.financeiro.push({
+            id: entradaUnicaAntiga ? entradaUnicaAntiga.id : uid(),
+            data: rec.dataEntrega||rec.data, tipo:"Entrada", categoria:"Venda de produto",
+            descricao: `${pedidoResumoProdutos(rec)} — ${cli?cli.nome:""}`, valor: pedidoTotal(rec),
+            pedidoId: rec.id, clienteId: rec.clienteId, formaPagamento: rec.formaPagamento, obs:"",
+            estoqueId: null, qtdEntrada: 0, itensEstoque: [],
+            liquidado,
+            liquidadoEm: liquidado ? (jaRecebido ? entradaUnicaAntiga.liquidadoEm : (rec.dataEntrega||rec.data)) : null,
+            vencimento: rec.aPrazo ? rec.vencimento : null,
+          });
+        }
       }
       saveDB(); closeSheet();
       toast(rec.status!=="Entregue" ? (isEdit?"Pedido atualizado":"Pedido lançado")
+            : mensagemParcelas ? mensagemParcelas
             : rec.aPrazo && !jaRecebido ? `Entregue — a receber${rec.vencimento?" até "+fmtDate(rec.vencimento):""}`
             : "Pedido entregue — estoque e caixa atualizados");
       render();
@@ -1639,12 +2025,12 @@ function openFollowForm(existing){
 
 function openEstoqueForm(existing){
   const isEdit = !!existing;
-  const v = existing || {categoria:"Hidratação", unidade:"Un", qtd:0, minimo:5, atualizadoEm:todayISO()};
+  const v = existing || {categoria:"Tratamento", unidade:"Unidades", qtd:0, minimo:5, atualizadoEm:todayISO()};
   openSheet(isEdit?"Editar produto":"Novo produto", `
     <div class="field"><label>Produto</label><input id="f-produto" value="${esc(v.produto||"")}" placeholder="Ex: Máscara Reconstrução 500ml"></div>
     <div class="field-row">
-      <div class="field"><label>Categoria</label><select id="f-cat">${["Hidratação","Nutrição","Reconstrução","Finalização","Outro"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
-      <div class="field"><label>Unidade</label><select id="f-un">${["Un","Kg","L","Ml"].map(o=>`<option ${v.unidade===o?"selected":""}>${o}</option>`).join("")}</select></div>
+      <div class="field"><label>Categoria</label><select id="f-cat">${["Tratamento","Finalizadores","Alinhamento"].map(o=>`<option ${v.categoria===o?"selected":""}>${o}</option>`).join("")}</select></div>
+      <div class="field"><label>Unidade</label><select id="f-un">${["Unidades"].map(o=>`<option ${v.unidade===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Qtd. em estoque</label><input id="f-qtd" type="number" min="0" value="${v.qtd}"></div>
