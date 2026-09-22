@@ -213,6 +213,13 @@ button.kpi{width:100%;text-align:left;cursor:pointer;font-size:inherit}
 .kpi .v{font-weight:700;font-size:clamp(17px,5.4vw,22px);line-height:1.15;letter-spacing:-.01em;color:var(--ink)}
 .kpi .l{font-size:12.5px;color:var(--ink-soft);margin-top:4px;line-height:1.35}
 
+/* três faixas lado a lado (total / mês / semana) — mais compacto que o
+   kpi-grid, que é pensado pra 1 ou 2 números grandes */
+.faixas{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:0 0 10px}
+.faixas .fx{background:var(--surface-card);border:1px solid var(--border);border-radius:12px;padding:10px 6px;text-align:center}
+.faixas .fx .v{font-weight:700;font-size:14px;color:var(--ink);letter-spacing:-.01em}
+.faixas .fx .l{font-size:10.5px;color:var(--ink-soft);margin-top:3px;line-height:1.25}
+
 .alert-card{
   display:flex;align-items:center;gap:12px;
   background:var(--surface-card);border:1px solid var(--border);border-radius:var(--radius);
@@ -406,6 +413,8 @@ button.kpi{width:100%;text-align:left;cursor:pointer;font-size:inherit}
 .conta .quando{font-size:12.5px;color:var(--ink-soft);margin-top:2px}
 .conta .quando.atrasado{color:var(--critical);font-weight:600}
 .conta .val{font-weight:700;font-size:15px;white-space:nowrap}
+.conta .acoes{display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
+.conta .acoes .btn{width:100%}
 
 /* prévia do parcelamento: cada parcela com data e valor, antes de salvar */
 .previa{background:var(--surface-card-2);border-radius:12px;padding:12px 14px;margin:2px 0 12px}
@@ -548,6 +557,16 @@ function deslocaData(iso, dias){
   d.setDate(d.getDate()+dias);
   return d.toISOString().slice(0,10);
 }
+/* Segunda a domingo da semana de hoje — é a janela que decide o que
+   aparece no topo do Financeiro (ver blocoEmAberto). Fora dela, só na
+   ficha do cliente. */
+function semanaAtual(){
+  const hoje = todayISO();
+  const dow = new Date(hoje+"T00:00:00").getDay(); // 0=domingo..6=sábado
+  const inicio = deslocaData(hoje, dow===0 ? -6 : -(dow-1));
+  return {inicio, fim: deslocaData(inicio, 6)};
+}
+function estaNaSemana(iso, semana){ return !!iso && iso>=semana.inicio && iso<=semana.fim; }
 function getProduto(id){ return db.estoque.find(e=>e.id===id); }
 /* "2 disponíveis", não "2 Unidades disponível" — a unidade é sempre
    unidade desde 17/09, repetir ela só atrapalhava a leitura. */
@@ -952,11 +971,17 @@ function computeKPIs(){
   const vencidos = aReceberLista.filter(f=> f.vencimento && f.vencimento < hoje);
   const venceHoje = aReceberLista.filter(f=> f.vencimento === hoje);
   const aReceberVencido = vencidos.reduce((s,f)=>s+(Number(f.valor)||0),0);
+  // três faixas do mesmo "a receber", pra caber "quanto entra essa
+  // semana" sem esconder o total — a semana usa a mesma janela do
+  // blocoEmAberto, o mês usa o `ym` de agora (não o mês navegado).
+  const semana = semanaAtual();
+  const aReceberSemana = aReceberLista.filter(f=>estaNaSemana(f.vencimento, semana)).reduce((s,f)=>s+(Number(f.valor)||0),0);
+  const aReceberMesAtual = aReceberLista.filter(f=>(f.vencimento||"").slice(0,7)===ym).reduce((s,f)=>s+(Number(f.valor)||0),0);
   return {clientesAtivos, leadsNovos, pedidosMes, pedidosMesValidos, faturamentoMes,
           custoMes, lucroMes, estoqueBaixo, estoqueNegativo, valorEstoque,
           followupsPendentes, followupsAtrasados, saldo,
           aReceber, aReceberLista, aPagar, aPagarLista,
-          vencidos, venceHoje, aReceberVencido};
+          vencidos, venceHoje, aReceberVencido, aReceberSemana, aReceberMesAtual};
 }
 
 /* ============================================================
@@ -1350,7 +1375,10 @@ function renderClienteDetalhe(c){
     return `<div class="conta">
       <button class="info" data-abrir="${f.id}"><div class="o-que">${esc(rotuloConta(f))}</div><div class="quando${atrasado?" atrasado":""}">${quando}</div></button>
       <div class="val tnum">${fmtMoney(f.valor)}</div>
-      <button class="btn primary small" data-liquidar="${f.id}">Recebi</button>
+      <div class="acoes">
+        <button class="btn primary small" data-liquidar="${f.id}">Recebi</button>
+        <button class="btn ghost small" data-pagar="${f.id}">Outro valor</button>
+      </div>
     </div>`;
   };
   const linhaRecebida = f=>`<div class="conta">
@@ -1419,6 +1447,7 @@ function renderClienteDetalhe(c){
   c.querySelectorAll("[data-pedido]").forEach(b=> b.addEventListener("click", ()=> openPedidoForm(db.pedidos.find(p=>p.id===b.dataset.pedido))));
   c.querySelectorAll("[data-follow]").forEach(b=> b.addEventListener("click", ()=> openFollowForm(db.followups.find(f=>f.id===b.dataset.follow))));
   c.querySelectorAll("[data-liquidar]").forEach(b=> b.addEventListener("click", ()=> liquidar(b.dataset.liquidar)));
+  c.querySelectorAll("[data-pagar]").forEach(b=> b.addEventListener("click", ()=> openPagamentoForm(db.financeiro.find(f=>f.id===b.dataset.pagar))));
   c.querySelectorAll("[data-abrir]").forEach(b=> b.addEventListener("click", ()=> openFinanceiroForm(db.financeiro.find(f=>f.id===b.dataset.abrir))));
   c.querySelectorAll("[data-desfazer]").forEach(b=> b.addEventListener("click", ()=>{
     const f = db.financeiro.find(x=>x.id===b.dataset.desfazer);
@@ -1794,13 +1823,93 @@ function desfazerLiquidacao(id){
   render();
 }
 
+/* Pagamento de valor livre — pra quando o cliente paga diferente do
+   combinado (R$ 130 numa parcela de R$ 100, sem avisar). Aplica a
+   partir da conta `f`: quita ela e, se sobrar, rola o excedente pras
+   próximas parcelas em aberto do mesmo parcelamento, na ordem; se faltar,
+   quita só uma parte dela e deixa o restante em aberto na própria conta
+   (mesmo vencimento, mesma parcela). Sem isso, R$ 130 numa de R$ 100 ou
+   sumia com os R$ 30 ou cobrava eles de novo na parcela seguinte. */
+function registrarPagamento(f, valorPago, data){
+  let restante = Math.round((Number(valorPago)||0)*100);
+  if(restante<=0) return {aplicado:0, sobra:0};
+  const inicial = restante;
+  const fila = [f];
+  if(f.parcelamentoId){
+    fila.push(...db.financeiro
+      .filter(x=>x.parcelamentoId===f.parcelamentoId && x.id!==f.id && !x.liquidado)
+      .sort((a,b)=>(a.parcelaNumero||0)-(b.parcelaNumero||0)));
+  }
+  for(const p of fila){
+    if(restante<=0) break;
+    const devido = Math.round((Number(p.valor)||0)*100);
+    if(devido<=0) continue;
+    if(restante>=devido){
+      p.liquidado = true; p.liquidadoEm = data;
+      restante -= devido;
+    } else {
+      db.financeiro.push({...p, id:uid(), valor:restante/100, liquidado:true, liquidadoEm:data});
+      p.valor = (devido-restante)/100;
+      restante = 0;
+    }
+  }
+  return {aplicado:(inicial-restante)/100, sobra:restante/100};
+}
+
+/* Folha do "Recebi com valor diferente" — atalho ao lado do "Recebi" na
+   ficha do cliente e no Financeiro, pra não precisar editar a parcela
+   na mão toda vez que o pagamento não bate com o combinado. */
+function openPagamentoForm(f){
+  if(!f) return;
+  const cli = getCliente(clienteIdDe(f));
+  openSheet("Recebimento com valor diferente", `
+    <p class="hint" style="margin-top:0">${esc(rotuloConta(f))}${cli?` — ${esc(cli.nome)}`:""} · combinado ${fmtMoney(f.valor)}</p>
+    <div class="field-row">
+      <div class="field"><label for="pg-valor">Valor pago (R$)</label><input id="pg-valor" type="number" inputmode="decimal" min="0.01" step="0.01" value="${f.valor}"></div>
+      <div class="field"><label for="pg-data">Data do pagamento</label><input id="pg-data" type="date" value="${todayISO()}"></div>
+    </div>
+    <p class="hint">Pagou mais que essa parcela? O que sobrar entra na próxima parcela em aberto. Pagou menos? O que faltar continua em aberto, nessa mesma parcela.</p>
+    <div class="btnrow">
+      <button class="btn ghost" id="cancel">Cancelar</button>
+      <button class="btn primary" id="save">Confirmar</button>
+    </div>
+  `, root=>{
+    const valorEl = root.querySelector("#pg-valor");
+    valorEl.focus(); valorEl.select();
+    root.querySelector("#cancel").addEventListener("click", closeSheet);
+    root.querySelector("#save").addEventListener("click", ()=>{
+      const valor = Number(valorEl.value);
+      const data = root.querySelector("#pg-data").value || todayISO();
+      if(!(valor>0)){ alert("Informe o valor pago."); return; }
+      const {sobra} = registrarPagamento(f, valor, data);
+      saveDB(); closeSheet();
+      toast(sobra>0.004
+        ? `Pagamento registrado — ${fmtMoney(sobra)} sobrou sem parcela em aberto pra entrar`
+        : "Pagamento registrado");
+      render();
+    });
+  });
+}
+
 /* Bloco de contas em aberto — fica no topo do Financeiro porque é a
    pergunta mais frequente do dia ("quem ainda me deve?"), e porque não
-   pertence a um mês só: vence quando vence. */
+   pertence a um mês só: vence quando vence.
+
+   Só mostra vencido + o que vence nesta semana — o resto (parcela lá na
+   frente, ou sem data combinada) fica de fora daqui de propósito, pra
+   não lotar o dia a dia com parcela que só vence daqui a um mês. Quem
+   quiser confirmar um pagamento adiantado dessas entra na ficha do
+   cliente, que continua listando tudo. */
 function blocoEmAberto(){
   const k = computeKPIs();
   if(k.aReceberLista.length===0 && k.aPagarLista.length===0) return "";
   const hoje = todayISO();
+  const semana = semanaAtual();
+  const naJanela = f=> (f.vencimento && f.vencimento < hoje) || estaNaSemana(f.vencimento, semana);
+  const aReceberVisivel = k.aReceberLista.filter(naJanela);
+  const aPagarVisivel = k.aPagarLista.filter(naJanela);
+  const receberFora = k.aReceberLista.length - aReceberVisivel.length;
+  const pagarFora = k.aPagarLista.length - aPagarVisivel.length;
 
   const linha = (f)=>{
     const cli = getCliente(f.clienteId) || (f.pedidoId ? getCliente((db.pedidos.find(p=>p.id===f.pedidoId)||{}).clienteId) : null);
@@ -1820,11 +1929,14 @@ function blocoEmAberto(){
         </div>
         <div class="card-value tnum" style="color:${f.tipo==='Entrada'?'var(--ok)':'var(--critical)'}">${fmtMoney(f.valor)}</div>
       </div>
-      <div class="card-row" style="margin-top:10px;align-items:center;gap:10px">
+      <div class="card-row" style="margin-top:10px;align-items:center;gap:10px 12px;flex-wrap:wrap">
         <span class="badge ${atrasado?"critical":hojeMesmo?"warn":"neutral"}">${quando}</span>
-        <button class="btn primary" style="flex:none;padding:8px 14px;font-size:13px" data-liquidar="${f.id}">
-          ${f.tipo==="Entrada"?"Recebi":"Paguei"}
-        </button>
+        <div style="display:flex;gap:8px;margin-left:auto">
+          ${f.tipo==="Entrada"?`<button class="btn ghost" style="flex:none;padding:8px 12px;font-size:13px" data-pagar="${f.id}">Valor diferente</button>`:""}
+          <button class="btn primary" style="flex:none;padding:8px 14px;font-size:13px" data-liquidar="${f.id}">
+            ${f.tipo==="Entrada"?"Recebi":"Paguei"}
+          </button>
+        </div>
       </div>
     </div>`;
   };
@@ -1838,19 +1950,23 @@ function blocoEmAberto(){
 
   return `
     ${k.aReceberLista.length ? `
-      <div class="section-label" style="display:flex;justify-content:space-between">
-        <span>A receber</span>
-        <span class="tnum" style="letter-spacing:0;text-transform:none;color:var(--ok)">${fmtMoney(k.aReceber)}</span>
+      <div class="section-label">A receber</div>
+      <div class="faixas">
+        <div class="fx"><div class="v tnum" style="color:var(--ok)">${fmtMoney(k.aReceber)}</div><div class="l">Total</div></div>
+        <div class="fx"><div class="v tnum">${fmtMoney(k.aReceberMesAtual)}</div><div class="l">Este mês</div></div>
+        <div class="fx"><div class="v tnum">${fmtMoney(k.aReceberSemana)}</div><div class="l">Esta semana</div></div>
       </div>
       ${k.aReceberVencido>0?`<p class="hint" style="color:var(--critical);margin:-4px 2px 10px">${fmtMoney(k.aReceberVencido)} já passou da data combinada.</p>`:""}
-      ${k.aReceberLista.slice().sort(ordena).map(linha).join("")}
+      ${aReceberVisivel.length ? aReceberVisivel.slice().sort(ordena).map(linha).join("") : `<p class="hint" style="margin:0 2px 10px">Nada vencido ou pra receber nesta semana.</p>`}
+      ${receberFora>0?`<p class="hint" style="margin:-2px 2px 14px">+ ${receberFora} conta${receberFora>1?"s":""} pra receber mais adiante — pra confirmar um pagamento adiantado, entre na ficha do cliente.</p>`:""}
     `:""}
     ${k.aPagarLista.length ? `
       <div class="section-label" style="display:flex;justify-content:space-between">
         <span>A pagar</span>
         <span class="tnum" style="letter-spacing:0;text-transform:none;color:var(--critical)">${fmtMoney(k.aPagar)}</span>
       </div>
-      ${k.aPagarLista.slice().sort(ordena).map(linha).join("")}
+      ${aPagarVisivel.length ? aPagarVisivel.slice().sort(ordena).map(linha).join("") : `<p class="hint" style="margin:0 2px 10px">Nada a pagar nesta semana.</p>`}
+      ${pagarFora>0?`<p class="hint" style="margin:-2px 2px 14px">+ ${pagarFora} conta${pagarFora>1?"s":""} a pagar mais adiante.</p>`:""}
     `:""}
     <div class="divider-orn" style="margin:20px 0 4px"></div>
   `;
@@ -1940,6 +2056,7 @@ function renderFinanceiro(c){
   c.querySelector("#mes-ant").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym,-1); state.finDia=null; renderFinanceiro(document.getElementById("content")); });
   c.querySelector("#mes-prox").addEventListener("click", ()=>{ state.finMes = deslocaMes(ym, 1); state.finDia=null; renderFinanceiro(document.getElementById("content")); });
   c.querySelectorAll("[data-liquidar]").forEach(b=> b.addEventListener("click", ()=> liquidar(b.dataset.liquidar)));
+  c.querySelectorAll("[data-pagar]").forEach(b=> b.addEventListener("click", ()=> openPagamentoForm(db.financeiro.find(f=>f.id===b.dataset.pagar))));
   c.querySelectorAll("[data-view]").forEach(b=> b.addEventListener("click", ()=>{ state.finView=b.dataset.view; if(state.finView!=="calendario") state.finDia=null; renderFinanceiro(document.getElementById("content")); }));
   c.querySelectorAll("[data-dia]").forEach(b=> b.addEventListener("click", ()=>{ state.finDia = state.finDia===b.dataset.dia ? null : b.dataset.dia; renderFinanceiro(document.getElementById("content")); }));
   const limparDia = c.querySelector("#limpar-dia");
