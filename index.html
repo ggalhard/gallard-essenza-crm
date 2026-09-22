@@ -652,13 +652,18 @@ function resumoPlano(plano){
   return `${plano.length}x: ` + grupos.map(g=>`${g.n} de ${fmtMoney(g.valor)}`).join(" e ");
 }
 
-/* Grava um plano como contas a receber do cliente, uma por parcela. */
-function lancarParcelas({clienteId, total, qtd, freq, primeiro, descricao, categoria}){
+/* Grava um plano como contas em aberto, uma por parcela — a receber
+   (tipo Entrada, o caso mais comum: débito de cliente) ou a pagar (tipo
+   Saída: despesa dividida entre meses, ex. compra parcelada no cartão).
+   Cada parcela cai no mês do seu próprio vencimento, então uma despesa
+   em 3x já nasce espalhada nos 3 meses certos, sem precisar somar nada
+   na mão depois. */
+function lancarParcelas({clienteId=null, tipo="Entrada", total, qtd, freq, primeiro, descricao, categoria, formaPagamento=""}){
   const planoId = uid();
   const plano = montarPlano(total, qtd, freq, primeiro);
   plano.forEach(x=> db.financeiro.push({
-    id: uid(), data: x.vencimento, tipo:"Entrada", categoria, descricao, valor: x.valor,
-    formaPagamento:"", pedidoId:null, clienteId, obs:"",
+    id: uid(), data: x.vencimento, tipo, categoria, descricao, valor: x.valor,
+    formaPagamento, pedidoId:null, clienteId, obs:"",
     parcelamentoId: planoId, parcelaNumero: x.numero, totalParcelas: plano.length,
     frequencia: FREQUENCIAS[freq].curto,
     estoqueId:null, qtdEntrada:0, itensEstoque:[],
@@ -854,8 +859,9 @@ function reconciliarEstoqueCompra(anterior, atual){
     atual.itensEstoque = [];
   }
 }
-/* Gera (ou regenera) as parcelas de um pedido pago em "Parcelado
-   personalizado". Nunca mexe nas parcelas já recebidas — só reajusta a
+/* Gera (ou regenera) as parcelas de um pedido pago em parcelas —
+   qualquer forma de pagamento (Cartão, Boleto, Pix combinado etc.), não
+   só a antiga "Parcelado personalizado". Nunca mexe nas parcelas já recebidas — só reajusta a
    numeração delas ("3/5"), pra continuar batendo depois de uma correção.
    As ainda não recebidas são sempre substituídas, recalculadas a partir
    do saldo restante (total do pedido menos o que já entrou) — é assim
@@ -885,7 +891,7 @@ function gerarParcelasPedido(pedido, cliente, parcelasAntigas){
       valor, pedidoId: pedido.id, clienteId: pedido.clienteId,
       parcelamentoId: planoId, parcelaNumero: indice+1, totalParcelas: liquidadas.length+quantidadeNovas,
       frequencia: FREQUENCIAS[freq].curto,
-      formaPagamento: "Parcelado personalizado", obs: "",
+      formaPagamento: pedido.formaPagamento || "Parcelado personalizado", obs: "",
       estoqueId: null, qtdEntrada: 0, itensEstoque: [],
       liquidado: false, liquidadoEm: null, vencimento: venc,
     });
@@ -1462,7 +1468,7 @@ function pedidoCard(p){
   const custo = pedidoCusto(p);
   const map = {"Pendente":"warn","Entregue":"ok","Cancelado":"critical"};
   const semVinculo = itens.some(i=>!i.produtoId || !getProduto(i.produtoId));
-  const parcelado = p.formaPagamento==="Parcelado personalizado";
+  const parcelado = !!p.parcelado || p.formaPagamento==="Parcelado personalizado";
   // entregue mas ainda não pago — o(s) lançamento(s) ligado(s) a ele não liquidaram.
   // Parcelado gera vários lançamentos (um por parcela); os demais, só um.
   const finsPedido = db.financeiro.filter(f=>f.pedidoId===p.id);
@@ -2317,6 +2323,16 @@ function openPedidoForm(existing){
       <div class="field"><label>Data de entrega</label><input id="f-entrega" type="date" value="${v.dataEntrega||""}"></div>
     </div>
 
+    <div id="modo-pag-box" style="display:none">
+      <div class="field"><label>Como vai receber</label>
+        <div class="seg" id="modo-pag" role="group" aria-label="De uma vez ou em parcelas">
+          <button type="button" data-modo="unico" aria-pressed="true">De uma vez</button>
+          <button type="button" data-modo="parcelado" aria-pressed="false">Em parcelas</button>
+        </div>
+      </div>
+      <p class="hint" style="margin-top:-6px">Vale pra qualquer forma de pagamento — inclusive Cartão e Boleto parcelados.</p>
+    </div>
+
     <div id="rec-box" style="display:none">
       <div class="field"><label>Recebimento</label>
         <select id="f-recebi">
@@ -2355,9 +2371,15 @@ function openPedidoForm(existing){
     const recBox = root.querySelector("#rec-box"), recEl = root.querySelector("#f-recebi"),
           vencBox = root.querySelector("#venc-box"), vencEl = root.querySelector("#f-venc"),
           pagEl = root.querySelector("#f-pag"),
-          parcelPedBox = root.querySelector("#parcel-ped-box");
+          parcelPedBox = root.querySelector("#parcel-ped-box"),
+          modoPagBox = root.querySelector("#modo-pag-box"), modoPagGroup = root.querySelector("#modo-pag");
     let parcelasPed = null; // calculadora de parcelas — ligada logo abaixo, depois das funções de total
-    function ehParcelado(){ return pagEl.value==="Parcelado personalizado"; }
+    // "Em parcelas" é independente da forma de pagamento — Cartão e Boleto
+    // parcelam igual a qualquer outra. "Parcelado personalizado" (valor
+    // antigo de formaPagamento) segue contando como parcelado pra não
+    // quebrar pedido já salvo antes dessa mudança.
+    let modoPag = (v.parcelado || v.formaPagamento==="Parcelado personalizado") ? "parcelado" : "unico";
+    function ehParcelado(){ return modoPag==="parcelado"; }
 
     /* Desconto sempre guardado em R$ no pedido (ver pedidoTotal); o campo
        "Tipo" só decide como o número digitado aqui é convertido na hora
@@ -2403,10 +2425,15 @@ function openPedidoForm(existing){
 
     /* O bloco de recebimento só aparece quando o pedido está Entregue —
        antes disso não há o que receber. E o campo de data só quando ela
-       escolhe "a receber". Parcelado personalizado usa um bloco próprio
-       no lugar deste, porque não é um único vencimento. */
+       escolhe "a receber". "Em parcelas" usa um bloco próprio no lugar
+       deste, porque não é um único vencimento — e vale pra qualquer
+       forma de pagamento, não só uma opção especial no seletor. */
     function toggleRecebimento(){
       const entregue = statusEl.value==="Entregue";
+      // fica visível mesmo em Pendente — dá pra já combinar "vai ser no
+      // cartão, em 3x" antes da entrega, do mesmo jeito que a forma de
+      // pagamento já era escolhida antes de entregar
+      modoPagBox.style.display = "block";
       recBox.style.display = (entregue && !ehParcelado()) ? "block" : "none";
       parcelPedBox.style.display = (entregue && ehParcelado()) ? "block" : "none";
       const aPrazo = recEl.value==="nao";
@@ -2421,6 +2448,14 @@ function openPedidoForm(existing){
       }
       atualizaPreviaParcelaPedido();
     }
+    modoPagGroup.querySelectorAll("[data-modo]").forEach(b=>{
+      b.setAttribute("aria-pressed", String(b.dataset.modo===modoPag));
+      b.addEventListener("click", ()=>{
+        modoPag = b.dataset.modo;
+        modoPagGroup.querySelectorAll("[data-modo]").forEach(x=> x.setAttribute("aria-pressed", String(x===b)));
+        toggleRecebimento();
+      });
+    });
     recEl.addEventListener("change", toggleRecebimento);
     pagEl.addEventListener("change", toggleRecebimento);
     toggleRecebimento();
@@ -2440,7 +2475,7 @@ function openPedidoForm(existing){
       const itensValidos=itens.filter(i=>i.produtoId && Number(i.qtd)>0);
       if(!itensValidos.length || itensValidos.length!==itens.length || itensValidos.some(i=>!getProduto(i.produtoId))){ alert("Escolha um produto do estoque e uma quantidade para cada item."); return; }
       const formaPag = root.querySelector("#f-pag").value;
-      const parcelado = formaPag==="Parcelado personalizado";
+      const parcelado = ehParcelado();
       const plano = parcelasPed.ler();
       if(statusEl.value==="Entregue" && parcelado && !plano.primeiro){ alert("Escolha a data do 1º vencimento das parcelas."); return; }
       const rec = {
@@ -2450,6 +2485,7 @@ function openPedidoForm(existing){
         itens: itensValidos.map(i=>({...i,qtd:Number(i.qtd)||0,valorUnit:Number(i.valorUnit)||0,custoUnit:Number(i.custoUnit)||0})),
         desconto: descontoAtualRS(),
         formaPagamento: formaPag,
+        parcelado,
         status: statusEl.value,
         dataEntrega: root.querySelector("#f-entrega").value,
         obs: root.querySelector("#f-obs").value.trim(),
@@ -2483,7 +2519,8 @@ function openPedidoForm(existing){
         // vencimento)? Então as parcelas ficam como estão — inclusive uma
         // data ou valor ajustado à mão numa delas. Refazer aqui mudaria
         // valores só porque você corrigiu uma observação no pedido.
-        const planoIgual = existing && existing.status==="Entregue" && existing.formaPagamento==="Parcelado personalizado"
+        const jaEraParcelado = existing && (existing.parcelado || existing.formaPagamento==="Parcelado personalizado");
+        const planoIgual = existing && existing.status==="Entregue" && jaEraParcelado
           && parcelasAntigas.length>0
           && Math.abs(pedidoTotal(existing)-pedidoTotal(rec)) < 0.005
           && qtdParcelasPedido(existing)===rec.parcelaQtd
@@ -2727,21 +2764,37 @@ function openFinanceiroForm(existing){
     <div id="generico-box">
     <div class="field"><label for="f-desc">Descrição</label><input id="f-desc" value="${esc(v.descricao||"")}"></div>
     <div class="field-row">
-      <div class="field"><label for="f-valor">Valor</label><input id="f-valor" type="number" inputmode="decimal" min="0" step="0.01" value="${v.valor??""}"></div>
+      <div class="field"><label for="f-valor">Valor${isEdit?"":" total"}</label><input id="f-valor" type="number" inputmode="decimal" min="0" step="0.01" value="${v.valor??""}"></div>
       <div class="field"><label for="f-pag">Forma de pagamento</label><select id="f-pag">${["Pix","Dinheiro","Cartão","Boleto","Transferência"].map(o=>`<option ${v.formaPagamento===o?"selected":""}>${o}</option>`).join("")}</select></div>
     </div>
 
-    <div class="field"><label for="f-liq">O dinheiro já entrou/saiu?</label>
-      <select id="f-liq">
-        <option value="sim" ${(v.liquidado===false)?"":"selected"}>Sim, já foi</option>
-        <option value="nao" ${(v.liquidado===false)?"selected":""}>Ainda não — está em aberto</option>
-      </select>
+    ${isEdit ? "" : `
+    <div class="field" id="modo-lanc-field"><label>Como lançar</label>
+      <div class="seg" id="modo-lanc" role="group" aria-label="De uma vez ou em parcelas">
+        <button type="button" data-modo="unico" aria-pressed="true">De uma vez</button>
+        <button type="button" data-modo="parcelado" aria-pressed="false">Em parcelas</button>
+      </div>
+      <p class="hint" style="margin-bottom:0">Vale pra Cartão, Boleto ou qualquer forma — uma despesa em 3x cai certinha nos 3 meses das parcelas, não tudo no mês do lançamento.</p>
     </div>
-    <div class="field" id="venc-box" style="display:none">
-      <label for="f-venc">Combinado para</label>
-      <input id="f-venc" type="date" value="${v.vencimento||""}">
+    `}
+
+    <div id="unico-box">
+      <div class="field"><label for="f-liq">O dinheiro já entrou/saiu?</label>
+        <select id="f-liq">
+          <option value="sim" ${(v.liquidado===false)?"":"selected"}>Sim, já foi</option>
+          <option value="nao" ${(v.liquidado===false)?"selected":""}>Ainda não — está em aberto</option>
+        </select>
+      </div>
+      <div class="field" id="venc-box" style="display:none">
+        <label for="f-venc">Combinado para</label>
+        <input id="f-venc" type="date" value="${v.vencimento||""}">
+      </div>
+      <p class="hint" id="liq-hint"></p>
     </div>
-    <p class="hint" id="liq-hint"></p>
+    <div id="parcelado-box" style="display:none">
+      ${camposParcelasHTML("gp", {qtd:2, freq:"mensal"})}
+      <p class="hint" id="parcelado-hint"></p>
+    </div>
     </div>
 
     ${v.pedidoId?`<p class="hint">Lançado sozinho a partir de um pedido entregue. Pra mudar valor ou data, edite o pedido — excluir o pedido remove esse lançamento junto.</p>`:""}
@@ -2759,8 +2812,38 @@ function openFinanceiroForm(existing){
           genericoBox = root.querySelector("#generico-box"), valorEl = root.querySelector("#f-valor"),
           compraBox = root.querySelector("#compra-itens"),
           liqEl = root.querySelector("#f-liq"), vencBox = root.querySelector("#venc-box"),
-          liqHint = root.querySelector("#liq-hint");
+          liqHint = root.querySelector("#liq-hint"),
+          modoLancGroup = root.querySelector("#modo-lanc"), unicoBox = root.querySelector("#unico-box"),
+          parceladoBox = root.querySelector("#parcelado-box"), parceladoHint = root.querySelector("#parcelado-hint");
     const debito = debitoBox ? ligarDebito(debitoBox, null) : null;
+    // "Em parcelas" só existe pra lançamento novo (editar um já existente
+    // continua sendo 1 conta só — mexer nas parcelas de um combinado se
+    // faz pela própria parcela, como no pedido). Fica indisponível em
+    // Compra de estoque, que já tem seu próprio jeito de dividir (itens).
+    let modoLanc = "unico";
+    let parcelasGen = null;
+    if(modoLancGroup){
+      parcelasGen = ligarParcelas(root, "gp", ()=>valorEl.value, ()=>root.querySelector("#f-data").value||todayISO());
+      modoLancGroup.querySelectorAll("[data-modo]").forEach(b=> b.addEventListener("click", ()=>{
+        modoLanc = b.dataset.modo;
+        modoLancGroup.querySelectorAll("[data-modo]").forEach(x=> x.setAttribute("aria-pressed", String(x===b)));
+        toggleModoLanc();
+      }));
+      root.querySelector("#f-data").addEventListener("change", ()=> parcelasGen.atualizar());
+    }
+    function toggleModoLanc(){
+      const parcelavel = modoLancGroup && catEl.value!=="Compra de estoque";
+      if(modoLancGroup) modoLancGroup.closest(".field").style.display = parcelavel ? "block" : "none";
+      const parcelado = parcelavel && modoLanc==="parcelado";
+      unicoBox.style.display = parcelado ? "none" : "block";
+      parceladoBox.style.display = parcelado ? "block" : "none";
+      if(parcelado){
+        parceladoHint.textContent = tipoEl.value==="Entrada"
+          ? "Cada parcela vira uma conta a receber, no mês do próprio vencimento."
+          : "Cada parcela vira uma conta a pagar, no mês do próprio vencimento — é o que faz uma despesa em 3x cair certa nos 3 meses, em vez de tudo de uma vez no mês do lançamento.";
+        parcelasGen.atualizar();
+      }
+    }
 
     const desfazerBtn = root.querySelector("#desfazer");
     if(desfazerBtn) desfazerBtn.addEventListener("click", ()=>{ closeSheet(); desfazerLiquidacao(v.id); });
@@ -2804,11 +2887,16 @@ function openFinanceiroForm(existing){
       if(CATEGORIAS_COM_CLIENTE.includes(cat)) tipoEl.value = "Entrada";
       valorEl.readOnly = ehCompra;
       if(ehCompra) atualizaCompraTotal();
+      if(ehCompra && modoLancGroup && modoLanc==="parcelado"){
+        modoLanc = "unico";
+        modoLancGroup.querySelectorAll("[data-modo]").forEach(x=> x.setAttribute("aria-pressed", String(x.dataset.modo==="unico")));
+      }
       toggleLiquidado();
+      toggleModoLanc();
     }
     catEl.addEventListener("change", atualizarCategoria);
     liqEl.addEventListener("change", toggleLiquidado);
-    tipoEl.addEventListener("change", toggleLiquidado);
+    tipoEl.addEventListener("change", ()=>{ toggleLiquidado(); toggleModoLanc(); });
     atualizarCategoria();
 
     const delBtn = root.querySelector("#del");
@@ -2834,6 +2922,13 @@ function openFinanceiroForm(existing){
       if(temCliente && !clienteId){ alert("Escolha o cliente."); return; }
       const valor = Number(valorEl.value)||0;
       if(valor<=0){ alert("Informe um valor maior que zero."); return; }
+      if(!ehCompra && modoLancGroup && modoLanc==="parcelado"){
+        const {qtd, freq, primeiro} = parcelasGen.ler();
+        if(!primeiro){ alert("Escolha a data da 1ª parcela."); return; }
+        const descricao = root.querySelector("#f-desc").value.trim() || catEl.value;
+        const plano = lancarParcelas({clienteId, tipo:tipoEl.value, total:valor, qtd, freq, primeiro, descricao, categoria:catEl.value, formaPagamento: root.querySelector("#f-pag").value});
+        state.finMes = primeiro.slice(0,7); saveDB(); closeSheet(); toast(`Lançado em ${resumoPlano(plano)}`); render(); return;
+      }
       const itensValidos=ehCompra?compraItens.filter(i=>i.produtoId&&Number(i.qtd)>0):[];
       if(ehCompra && (!itensValidos.length || itensValidos.length!==compraItens.length)){ alert("Escolha produto e quantidade para todos os itens da compra."); return; }
       const rec = {
